@@ -417,6 +417,7 @@ while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
     # where the run is at this step, before its update: the x-axes of every log at this step (eval and training)
     progress = {
+        "run_progress": step / num_iterations,
         "throughput/total_tokens": total_batch_size * step,
         "throughput/total_gflops": flops_so_far / 1e9,
         "throughput/total_training_time": total_training_time,
@@ -428,11 +429,12 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
+            "eval/loss": val_loss,
             "eval/bpb": val_bpb,
             **progress,
         }, step=step)
@@ -509,6 +511,7 @@ while True:
     synchronize()
     t0 = time.time()
     loss_sum = 0 # for logging: this step's loss summed over its micro-batches
+    loading_time = 0 # for logging: this step's time in the loader (CPU time, overlapping the GPU's queued forward/backward)
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         loss_sum = loss_sum + loss.detach()
@@ -517,7 +520,9 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        t_load = time.time()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        loading_time += time.time() - t_load
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -540,7 +545,10 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
-    train_loss_f = (loss_sum / grad_accum_steps).item() # this step's mean loss over its micro-batches; .item() is a CPU-GPU sync point
+    train_loss = loss_sum / grad_accum_steps # this step's mean loss over this rank's micro-batches
+    if is_ddp_initialized():
+        dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # and over the ranks: the mean loss of the whole batch
+    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -570,6 +578,7 @@ while True:
         "throughput/tokens_per_second": tok_per_sec,
         "throughput/gflops_per_second": flops_per_sec / 1e9,
         "throughput/duration": dt,
+        "throughput/loading_time": loading_time,
         "throughput/mfu": mfu,
         "memory/peak_gib": get_max_memory() / 2**30, # the peak allocated since the run started (this rank's)
         **{f"optim/lr/{group['name']}": group["lr"] for group in optimizer.param_groups}, # (the Muon groups share "matrix")
