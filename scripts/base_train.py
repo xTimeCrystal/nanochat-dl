@@ -414,12 +414,11 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
     # where the run is at this step, before its update: the x-axes of every log at this step (eval and training)
     progress = {
         "run_progress": step / num_iterations,
         "throughput/total_tokens": total_batch_size * step,
-        "throughput/total_gflops": flops_so_far / 1e9,
+        "throughput/total_gflops": num_flops_per_token * total_batch_size * step / 1e9,
         "throughput/total_training_time": total_training_time,
     }
 
@@ -572,6 +571,12 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    # parameter norms per optimizer group, in fp32 (the embeddings are stored in bf16); the Muon groups share "matrix"
+    param_sq = {}
+    for group in optimizer.param_groups:
+        group_sq = torch.stack([torch.linalg.vector_norm(p, dtype=torch.float32) for p in group["params"]]).square().sum()
+        param_sq[group["name"]] = param_sq.get(group["name"], 0) + group_sq
+    param_norms = dict(zip(param_sq, torch.stack(list(param_sq.values())).sqrt().tolist())) # one CPU-GPU sync
     wandb_run.log({
         "train/loss": train_loss_f,
         **progress,
@@ -583,9 +588,10 @@ while True:
         "memory/peak_gib": get_max_memory() / 2**30, # the peak allocated since the run started (this rank's)
         **{f"optim/lr/{group['name']}": group["lr"] for group in optimizer.param_groups}, # (the Muon groups share "matrix")
         "optim/muon_momentum": muon_momentum,
-        "optim/weight_decay": muon_weight_decay,
+        "optim/muon_weight_decay": muon_weight_decay,
         "grad/norm/total": optimizer.grad_norm.item(),
-        "params/norm/total": torch.nn.utils.get_total_norm(orig_model.parameters()).item(),
+        "params/norm/total": math.sqrt(sum(norm ** 2 for norm in param_norms.values())),
+        **{f"params/norm/{name}": norm for name, norm in param_norms.items()},
         "data/epoch": dataloader_state_dict["epoch"],
         "data/pq_idx": dataloader_state_dict["pq_idx"],
         "data/rg_idx": dataloader_state_dict["rg_idx"],
