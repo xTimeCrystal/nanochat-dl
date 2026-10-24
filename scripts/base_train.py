@@ -510,7 +510,6 @@ while True:
     synchronize()
     t0 = time.time()
     loss_sum = 0 # for logging: this step's loss summed over its micro-batches
-    loading_time = 0 # for logging: this step's time in the loader (CPU time, overlapping the GPU's queued forward/backward)
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         loss_sum = loss_sum + loss.detach()
@@ -519,9 +518,7 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        t_load = time.time()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-        loading_time += time.time() - t_load
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -583,7 +580,6 @@ while True:
         "throughput/tokens_per_second": tok_per_sec,
         "throughput/gflops_per_second": flops_per_sec / 1e9,
         "throughput/duration": dt,
-        "throughput/loading_time": loading_time,
         "throughput/mfu": mfu,
         "memory/peak_gib": get_max_memory() / 2**30, # the peak allocated since the run started (this rank's)
         **{f"optim/lr/{group['name']}": group["lr"] for group in optimizer.param_groups}, # (the Muon groups share "matrix")
