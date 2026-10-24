@@ -571,6 +571,7 @@ while True:
         "throughput/gflops_per_second": flops_per_sec / 1e9,
         "throughput/duration": dt,
         "throughput/mfu": mfu,
+        "memory/peak_gib": get_max_memory() / 2**30, # the peak allocated since the run started (this rank's)
         **{f"optim/lr/{group['name']}": group["lr"] for group in optimizer.param_groups}, # (the Muon groups share "matrix")
         "optim/muon_momentum": muon_momentum,
         "optim/weight_decay": muon_weight_decay,
