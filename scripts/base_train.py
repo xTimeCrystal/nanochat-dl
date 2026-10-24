@@ -394,14 +394,12 @@ if not resuming:
     step = 0
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
-    smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
-    smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
@@ -495,7 +493,6 @@ while True:
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
                 },
             },
@@ -514,8 +511,7 @@ while True:
     loss_sum = 0 # for logging: this step's loss summed over its micro-batches
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss_sum = loss_sum + train_loss
+        loss_sum = loss_sum + loss.detach()
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -544,16 +540,13 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
-    train_loss_f, step_loss_f = torch.stack([train_loss, loss_sum / grad_accum_steps]).tolist() # one CPU-GPU sync point
+    train_loss_f = (loss_sum / grad_accum_steps).item() # this step's mean loss over its micro-batches; .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
-    ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
@@ -570,9 +563,9 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     wandb_run.log({
-        "train/loss": step_loss_f,
+        "train/loss": train_loss_f,
         **progress,
         "throughput/tokens_per_second": tok_per_sec,
         "throughput/gflops_per_second": flops_per_sec / 1e9,
@@ -581,6 +574,11 @@ while True:
         **{f"optim/lr/{group['name']}": group["lr"] for group in optimizer.param_groups}, # (the Muon groups share "matrix")
         "optim/muon_momentum": muon_momentum,
         "optim/weight_decay": muon_weight_decay,
+        "grad/norm/total": optimizer.grad_norm.item(),
+        "params/norm/total": torch.nn.utils.get_total_norm(orig_model.parameters()).item(),
+        "data/epoch": dataloader_state_dict["epoch"],
+        "data/pq_idx": dataloader_state_dict["pq_idx"],
+        "data/rg_idx": dataloader_state_dict["rg_idx"],
     }, step=step)
 
     # state update

@@ -270,6 +270,8 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # set by step(), for logging: the global norm of the reduced (averaged) gradient
+        self.grad_norm = torch.tensor(float("nan"))
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -325,6 +327,8 @@ class MuonAdamW(torch.optim.Optimizer):
             if pinfo['future'] is not None:
                 pinfo['future'].wait()
             grad_slice = pinfo['grad_slice']
+            if not pinfo['is_small'] or rank == 0: # (a small param's reduced gradient is on every rank: count it once)
+                self._grad_sq.append(torch.linalg.vector_norm(grad_slice, dtype=torch.float32).square())
             state = self.state[p]
 
             # For small params, operate on full param; for large, operate on slice
@@ -372,6 +376,8 @@ class MuonAdamW(torch.optim.Optimizer):
         # How many params does this rank own?
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
+        if num_owned > 0: # (before the fused step, which updates the gradient in place)
+            self._grad_sq.append(torch.linalg.vector_norm(grad_chunk[:num_owned], dtype=torch.float32).square())
 
         # Get or create group-level state
         state = self.state[p]
@@ -447,6 +453,7 @@ class MuonAdamW(torch.optim.Optimizer):
 
         # Phase 2: wait for reduces, compute updates, launch gathers
         gather_list: list[dict] = []
+        self._grad_sq: list[torch.Tensor] = [] # squared norms of this rank's shards of the reduced gradient
         for group, info in zip(self.param_groups, reduce_infos):
             if group['kind'] == 'adamw':
                 self._compute_adamw(group, info, gather_list, rank, world_size)
@@ -457,3 +464,9 @@ class MuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+        # The global gradient norm: the ranks' shards are disjoint, so their squared norms add up
+        grad_sq = torch.stack(self._grad_sq).sum()
+        if world_size > 1:
+            dist.all_reduce(grad_sq)
+        self.grad_norm = grad_sq.sqrt()
