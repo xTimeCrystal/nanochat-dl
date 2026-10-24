@@ -150,16 +150,17 @@ def forward_model(model, input_ids, start=0, end=None):
     """
     batch_size, seq_len = input_ids.size()
     end = seq_len if end is None else end
-    outputs = model(input_ids, logit_positions=slice(start, end)) # (B, end - start, V)
+    num_positions = end - start
+    outputs = model(input_ids, logit_positions=slice(start, end)) # (B, num_positions, V)
     # Roll the tensor to the left by one position to get the (autoregressive) target ids
-    target_ids = torch.roll(input_ids, shifts=-1, dims=1)[:, start:end]
+    target_ids = torch.roll(input_ids, shifts=-1, dims=1)[:, start:end].contiguous() # (a column slice: contiguous to view it)
     # Calculate cross entropy at the computed positions
     losses = torch.full((batch_size, seq_len), float('nan'), device=input_ids.device)
     losses[:, start:end] = torch.nn.functional.cross_entropy(
-        outputs.reshape(-1, outputs.size(-1)),
-        target_ids.reshape(-1),
+        outputs.view(batch_size * num_positions, -1),
+        target_ids.view(batch_size * num_positions),
         reduction='none'
-    ).view(batch_size, end - start)
+    ).view(batch_size, num_positions)
     # Set the last column to be nan because there is no autoregressive loss there
     losses[:, -1] = float('nan')
     # Get the argmax predictions at the computed positions
