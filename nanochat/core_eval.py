@@ -142,25 +142,29 @@ def batch_sequences_lm(tokenizer, prompts):
 
 
 @torch.no_grad()
-def forward_model(model, input_ids):
+def forward_model(model, input_ids, start=0, end=None):
     """
     Take BxT tensor of token ids, return BxT tensor of losses and argmax predictions.
-    The last column of losses is set to nan because we don't have autoregressive targets there.
+    Only positions start..end-1 are computed (the logits elsewhere are never formed): losses are nan and
+    predictions -1 outside them. The last column of losses is nan because we don't have autoregressive targets there.
     """
     batch_size, seq_len = input_ids.size()
-    outputs = model(input_ids)
+    end = seq_len if end is None else end
+    outputs = model(input_ids, logit_positions=slice(start, end)) # (B, end - start, V)
     # Roll the tensor to the left by one position to get the (autoregressive) target ids
-    target_ids = torch.roll(input_ids, shifts=-1, dims=1)
-    # Calculate cross entropy at all positions
-    losses = torch.nn.functional.cross_entropy(
-        outputs.view(batch_size * seq_len, -1),
-        target_ids.view(batch_size * seq_len),
+    target_ids = torch.roll(input_ids, shifts=-1, dims=1)[:, start:end]
+    # Calculate cross entropy at the computed positions
+    losses = torch.full((batch_size, seq_len), float('nan'), device=input_ids.device)
+    losses[:, start:end] = torch.nn.functional.cross_entropy(
+        outputs.reshape(-1, outputs.size(-1)),
+        target_ids.reshape(-1),
         reduction='none'
-    ).view(batch_size, seq_len)
+    ).view(batch_size, end - start)
     # Set the last column to be nan because there is no autoregressive loss there
     losses[:, -1] = float('nan')
-    # Get the argmax predictions at each position
-    predictions = outputs.argmax(dim=-1)
+    # Get the argmax predictions at the computed positions
+    predictions = torch.full_like(input_ids, -1)
+    predictions[:, start:end] = outputs.argmax(dim=-1)
     return losses, predictions
 
 
@@ -217,8 +221,9 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     input_ids = stack_sequences(tokens, pad_token_id)
     input_ids = input_ids.to(device)
 
-    # Forward the model, get the autoregressive loss and argmax prediction at each token
-    losses, predictions = forward_model(model, input_ids)
+    # Forward the model, get the autoregressive loss and argmax prediction at the scored tokens only
+    # (the prediction at position i is for token i+1, so tokens start..end-1 need positions start-1..end-2)
+    losses, predictions = forward_model(model, input_ids, min(start_idxs) - 1, max(end_idxs) - 1)
 
     # See if the losses/predictions come out correctly
     if task_type == 'language_modeling':

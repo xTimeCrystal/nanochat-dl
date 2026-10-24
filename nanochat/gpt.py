@@ -456,7 +456,9 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', logit_positions=None):
+        # logit_positions: compute the logits (and the loss) only at these sequence positions, e.g. a slice or an index tensor.
+        # The logits are B x T x vocab in fp32, so an eval that scores a few tokens per row can skip the rest. None = all.
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -506,6 +508,9 @@ class GPT(nn.Module):
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
+        if logit_positions is not None:
+            x = x[:, logit_positions]
+            targets = None if targets is None else targets[:, logit_positions]
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
