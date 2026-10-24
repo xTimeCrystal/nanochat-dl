@@ -38,28 +38,21 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         loss2d = model(x, y, loss_reduction='none') # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
-        if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32
-            # slightly more complex code path if some target tokens are ignore_index (e.g. -1)
-            # any target token < 0 is to be ignored: do NOT index token_bytes with negatives
-            valid = y >= 0
-            y_safe = torch.where(valid, y, torch.zeros_like(y))
-            # map valid targets to their byte length; ignored targets contribute 0 bytes
-            num_bytes2d = torch.where(
-                valid,
-                token_bytes[y_safe],
-                torch.zeros_like(y, dtype=token_bytes.dtype)
-            )
-            total_nats += (loss2d * (num_bytes2d > 0)).sum()
-            total_bytes += num_bytes2d.sum()
-            total_loss += (loss2d * valid).sum()
-            total_tokens += valid.sum()
-        else:
-            # fast path: no ignored targets, safe to index directly
-            num_bytes2d = token_bytes[y]
-            total_nats += (loss2d * (num_bytes2d > 0)).sum()
-            total_bytes += num_bytes2d.sum()
-            total_loss += loss2d.sum()
-            total_tokens += y.numel()
+        # any target token < 0 is to be ignored (ignore_index, e.g. -1): do NOT index token_bytes with negatives.
+        # One path whether or not there are any: branching on it would sync the CPU with the GPU every batch,
+        # leaving the GPU idle while the loader packs the next one.
+        valid = y.int() >= 0 # (int32: mps does not currently have kernel for < 0 for int64)
+        y_safe = torch.where(valid, y, torch.zeros_like(y))
+        # map valid targets to their byte length; ignored targets contribute 0 bytes
+        num_bytes2d = torch.where(
+            valid,
+            token_bytes[y_safe],
+            torch.zeros_like(y, dtype=token_bytes.dtype)
+        )
+        total_nats += (loss2d * (num_bytes2d > 0)).sum()
+        total_bytes += num_bytes2d.sum()
+        total_loss += (loss2d * valid).sum()
+        total_tokens += valid.sum()
     # sum reduce across all ranks
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if world_size > 1:
