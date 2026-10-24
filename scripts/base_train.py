@@ -320,8 +320,15 @@ optimizer = model.setup_optimizer(
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
-param_names = {id(p): n for n, p in orig_model.named_parameters()} # optim/lr/<group>: the group's first param, or "matrix" (Muon)
-group_names = ["matrix" if g["kind"] == "muon" else re.sub(r"(\.\d+)?\.weight$", "", param_names[id(g["params"][0])]) for g in optimizer.param_groups]
+
+# Names of the optimizer's param groups in the wandb logs (optim/lr/<name>): the Muon groups share one LR and are all
+# "matrix"; an AdamW group is named after its first parameter (value_embeds.0.weight -> value_embeds)
+param_names = {id(p): n for n, p in orig_model.named_parameters()}
+def group_name(group):
+    if group["kind"] == "muon":
+        return "matrix"
+    return re.sub(r"(\.\d+)?\.weight$", "", param_names[id(group["params"][0])])
+group_names = [group_name(g) for g in optimizer.param_groups]
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
@@ -431,7 +438,9 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({"eval/bpb": val_bpb}, step=step)
+        wandb_run.log({
+            "eval/bpb": val_bpb,
+        }, step=step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -443,7 +452,10 @@ while True:
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({"eval/core_metric": results["core_metric"], "eval/centered_results": results["centered_results"]}, step=step)
+        wandb_run.log({
+            "eval/core_metric": results["core_metric"],
+            "eval/centered_results": results["centered_results"],
+        }, step=step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
