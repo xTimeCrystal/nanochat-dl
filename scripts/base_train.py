@@ -325,15 +325,13 @@ if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
-# wandb names of the optimizer's param groups (optim/lr/<name>), from their parameters' names: every Muon group is
-# "matrix" (they share one LR), an AdamW group is named after its first parameter (value_embeds.0.weight -> value_embeds)
-_GROUP_NAMES = {"lm_head": "unembedding", "transformer.wte": "embedding", "smear_gate": "smear"}
+# wandb names of the optimizer's param groups (optim/lr/<name>): every Muon group is "matrix" (they share one LR), an
+# AdamW group is named after its first parameter (value_embeds.0.weight -> value_embeds)
 _param_names = {id(p): n for n, p in orig_model.named_parameters()}
 def _group_name(group):
     if group["kind"] == "muon":
         return "matrix"
-    name = re.sub(r"(\.\d+)?(\.(weight|bias))?$", "", _param_names[id(group["params"][0])])
-    return _GROUP_NAMES.get(name, name.replace(".", "_"))
+    return re.sub(r"(\.\d+)?(\.(weight|bias))?$", "", _param_names[id(group["params"][0])])
 group_names = [_group_name(g) for g in optimizer.param_groups]
 print0(f"Optimizer groups (optim/lr/<name>): {', '.join(dict.fromkeys(group_names))}")
 
