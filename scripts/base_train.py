@@ -76,7 +76,6 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
-parser.add_argument("--log-every", type=int, default=1, help="log training metrics to wandb every N steps (0 = never)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -100,10 +99,7 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
-# Every wandb_run.log below passes step=step, so wandb's own step (the default x-axis) is the training step. Otherwise it
-# counts log calls (train, val and CORE logs at different cadences put e.g. the step-750 val point at x=753).
-# Metric names follow Marin / Levanter: train/loss (this step's loss), eval/..., throughput/..., optim/..., global_step,
-# run_progress; each dict lists the loss first.
+# every wandb_run.log passes step=step: wandb's x-axis is then the training step, not the count of log calls
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -324,16 +320,8 @@ optimizer = model.setup_optimizer(
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
-
-# wandb names of the optimizer's param groups (optim/lr/<name>): every Muon group is "matrix" (they share one LR), an
-# AdamW group is named after its first parameter (value_embeds.0.weight -> value_embeds)
-_param_names = {id(p): n for n, p in orig_model.named_parameters()}
-def _group_name(group):
-    if group["kind"] == "muon":
-        return "matrix"
-    return re.sub(r"(\.\d+)?(\.(weight|bias))?$", "", _param_names[id(group["params"][0])])
-group_names = [_group_name(g) for g in optimizer.param_groups]
-print0(f"Optimizer groups (optim/lr/<name>): {', '.join(dict.fromkeys(group_names))}")
+param_names = {id(p): n for n, p in orig_model.named_parameters()} # optim/lr/<group>: the group's first param, or "matrix" (Muon)
+group_names = ["matrix" if g["kind"] == "muon" else re.sub(r"(\.\d+)?\.weight$", "", param_names[id(g["params"][0])]) for g in optimizer.param_groups]
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
@@ -443,10 +431,7 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
-            "eval/bpb": val_bpb,
-            "global_step": step,
-        }, step=step)
+        wandb_run.log({"eval/bpb": val_bpb}, step=step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -458,11 +443,7 @@ while True:
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "eval/core_metric": results["core_metric"],
-            **{f"eval/core/{task}": centered for task, centered in results["centered_results"].items()},
-            "global_step": step,
-        }, step=step)
+        wandb_run.log({"eval/core_metric": results["core_metric"], "eval/centered_results": results["centered_results"]}, step=step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -520,7 +501,7 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    loss_sum = 0 # this step's loss summed over micro-batches (rank 0's data), for logging
+    loss_sum = 0 # for logging: this step's loss summed over its micro-batches
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
@@ -580,31 +561,16 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if args.log_every > 0 and step % args.log_every == 0:
-        # every metric of the step, at the step (see the wandb init above); master process only (others: dummy)
-        log_data = {
-            "train/loss": step_loss_f, # this step's mean loss over its micro-batches (rank 0's data), as Levanter's
-            "global_step": step,
-            "run_progress": (step + 1) / num_iterations,
-            "throughput/total_tokens": total_batch_size * (step + 1),
-            "throughput/total_gflops": num_flops_per_token * total_batch_size * (step + 1) / 1e9,
-            "throughput/tokens_per_second": tok_per_sec,
-            "throughput/examples_per_second": total_batch_size / args.max_seq_len / dt, # sequences of max_seq_len
-            "throughput/gflops_per_second": num_flops_per_token * total_batch_size / dt / 1e9,
-            "throughput/duration": dt,
-            "throughput/mfu": mfu, # percent
-            "throughput/total_training_time": total_training_time, # seconds, the first steps (compilation) excluded
-            "optim/learning_rate": next(g["lr"] for g in optimizer.param_groups if g["kind"] == "muon"), # the matrix LR
-            **{f"optim/lr/{name}": group["lr"] for name, group in zip(group_names, optimizer.param_groups)}, # as applied
-            "optim/lr_multiplier": lrm,
-            "optim/muon_momentum": muon_momentum,
-            "optim/weight_decay": muon_weight_decay, # Muon's (scheduled); the AdamW groups' are constant
-            "memory/peak_gib": get_max_memory() / 2**30,
-            "data/epoch": dataloader_state_dict["epoch"],
-            "data/pq_idx": dataloader_state_dict["pq_idx"],
-            "data/rg_idx": dataloader_state_dict["rg_idx"],
-        }
-        wandb_run.log(log_data, step=step)
+    wandb_run.log({
+        "train/loss": step_loss_f,
+        "throughput/total_tokens": total_batch_size * (step + 1),
+        "throughput/tokens_per_second": tok_per_sec,
+        "throughput/mfu": mfu,
+        "throughput/total_training_time": total_training_time,
+        **{f"optim/lr/{name}": group["lr"] for name, group in zip(group_names, optimizer.param_groups)},
+        "optim/muon_momentum": muon_momentum,
+        "optim/weight_decay": muon_weight_decay,
+    }, step=step)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
