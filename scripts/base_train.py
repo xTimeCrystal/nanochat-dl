@@ -451,7 +451,7 @@ while True:
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "eval/core_metric": results["core_metric"],
-            "eval/centered_results": results["centered_results"],
+            **{f"core/{task}": centered for task, centered in results["centered_results"].items()}, # per task, in a section of their own
             **progress,
         }, step=step)
         model.train()
