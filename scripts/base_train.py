@@ -15,6 +15,7 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
 import json
+import re
 import time
 import math
 import argparse
@@ -101,6 +102,8 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 # Every wandb_run.log below passes step=step, so wandb's own step (the default x-axis) is the training step. Otherwise it
 # counts log calls (train, val and CORE logs at different cadences put e.g. the step-750 val point at x=753).
+# Metric names follow Marin / Levanter: train/loss (this step's loss), eval/..., throughput/..., optim/..., global_step,
+# run_progress; each dict lists the loss first.
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -322,6 +325,18 @@ if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
+# wandb names of the optimizer's param groups (optim/lr/<name>), from their parameters' names: every Muon group is
+# "matrix" (they share one LR), an AdamW group is named after its first parameter (value_embeds.0.weight -> value_embeds)
+_GROUP_NAMES = {"lm_head": "unembedding", "transformer.wte": "embedding", "smear_gate": "smear"}
+_param_names = {id(p): n for n, p in orig_model.named_parameters()}
+def _group_name(group):
+    if group["kind"] == "muon":
+        return "matrix"
+    name = re.sub(r"(\.\d+)?(\.(weight|bias))?$", "", _param_names[id(group["params"][0])])
+    return _GROUP_NAMES.get(name, name.replace(".", "_"))
+group_names = [_group_name(g) for g in optimizer.param_groups]
+print0(f"Optimizer groups (optim/lr/<name>): {', '.join(dict.fromkeys(group_names))}")
+
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
@@ -431,10 +446,8 @@ while True:
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "val/bpb": val_bpb,
+            "eval/bpb": val_bpb,
+            "global_step": step,
         }, step=step)
         model.train()
 
@@ -448,10 +461,9 @@ while True:
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
+            "eval/core_metric": results["core_metric"],
+            **{f"eval/core/{task}": centered for task, centered in results["centered_results"].items()},
+            "global_step": step,
         }, step=step)
         model.train()
 
@@ -573,20 +585,24 @@ while True:
     if args.log_every > 0 and step % args.log_every == 0:
         # every metric of the step, at the step (see the wandb init above); master process only (others: dummy)
         log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss, # EMA (as printed)
-            "train/loss_step": step_loss_f, # this step's mean loss over its micro-batches, unsmoothed
-            "train/tokens": total_batch_size * (step + 1),
-            "train/lrm": lrm,
-            "train/lr_matrix": args.matrix_lr * batch_lr_scale * lrm,
-            "train/muon_momentum": muon_momentum,
-            "train/muon_weight_decay": muon_weight_decay,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-            "train/peak_mem_gib": get_max_memory() / 2**30,
+            "train/loss": step_loss_f, # this step's mean loss over its micro-batches (rank 0's data), as Levanter's
+            "train/loss_ema": debiased_smooth_loss, # the debiased EMA the console prints
+            "global_step": step,
+            "run_progress": (step + 1) / num_iterations,
+            "throughput/total_tokens": total_batch_size * (step + 1),
+            "throughput/total_gflops": num_flops_per_token * total_batch_size * (step + 1) / 1e9,
+            "throughput/tokens_per_second": tok_per_sec,
+            "throughput/examples_per_second": total_batch_size / args.max_seq_len / dt, # sequences of max_seq_len
+            "throughput/gflops_per_second": num_flops_per_token * total_batch_size / dt / 1e9,
+            "throughput/duration": dt,
+            "throughput/mfu": mfu, # percent
+            "throughput/total_training_time": total_training_time, # seconds, the first steps (compilation) excluded
+            "optim/learning_rate": next(g["lr"] for g in optimizer.param_groups if g["kind"] == "muon"), # the matrix LR
+            **{f"optim/lr/{name}": group["lr"] for name, group in zip(group_names, optimizer.param_groups)}, # as applied
+            "optim/lr_multiplier": lrm,
+            "optim/muon_momentum": muon_momentum,
+            "optim/weight_decay": muon_weight_decay, # Muon's (scheduled); the AdamW groups' are constant
+            "memory/peak_gib": get_max_memory() / 2**30,
             "data/epoch": dataloader_state_dict["epoch"],
             "data/pq_idx": dataloader_state_dict["pq_idx"],
             "data/rg_idx": dataloader_state_dict["rg_idx"],
