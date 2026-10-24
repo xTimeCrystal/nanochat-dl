@@ -15,7 +15,6 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
 import json
-import re
 import time
 import math
 import argparse
@@ -321,15 +320,6 @@ if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
-# Names of the optimizer's param groups in the wandb logs (optim/lr/<name>): the Muon groups share one LR and are all
-# "matrix"; an AdamW group is named after its first parameter (value_embeds.0.weight -> value_embeds)
-param_names = {id(p): n for n, p in orig_model.named_parameters()}
-def group_name(group):
-    if group["kind"] == "muon":
-        return "matrix"
-    return re.sub(r"(\.\d+)?\.weight$", "", param_names[id(group["params"][0])])
-group_names = [group_name(g) for g in optimizer.param_groups]
-
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
@@ -579,7 +569,7 @@ while True:
         "throughput/tokens_per_second": tok_per_sec,
         "throughput/mfu": mfu,
         "throughput/total_training_time": total_training_time,
-        **{f"optim/lr/{name}": group["lr"] for name, group in zip(group_names, optimizer.param_groups)},
+        **{f"optim/lr/{group['name']}": group["lr"] for group in optimizer.param_groups}, # (the Muon groups share "matrix")
         "optim/muon_momentum": muon_momentum,
         "optim/weight_decay": muon_weight_decay,
     }, step=step)
