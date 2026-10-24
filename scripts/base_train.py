@@ -586,7 +586,6 @@ while True:
         # every metric of the step, at the step (see the wandb init above); master process only (others: dummy)
         log_data = {
             "train/loss": step_loss_f, # this step's mean loss over its micro-batches (rank 0's data), as Levanter's
-            "train/loss_ema": debiased_smooth_loss, # the debiased EMA the console prints
             "global_step": step,
             "run_progress": (step + 1) / num_iterations,
             "throughput/total_tokens": total_batch_size * (step + 1),
