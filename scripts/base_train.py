@@ -41,6 +41,7 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--wandb-project", type=str, default="nanochat", help="wandb project to log the run to")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -97,7 +98,8 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=args.wandb_project, name=args.run, config=user_config)
+# every wandb_run.log passes step=step: wandb's x-axis is then the training step, not the count of log calls
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -393,14 +395,12 @@ if not resuming:
     step = 0
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
-    smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
-    smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
@@ -415,7 +415,13 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    # where the run is at this step, before its update: the x-axes of every log at this step (eval and training)
+    progress = {
+        "run_progress": step / num_iterations,
+        "throughput/total_tokens": total_batch_size * step,
+        "throughput/total_gflops": num_flops_per_token * total_batch_size * step / 1e9,
+        "throughput/total_training_time": total_training_time,
+    }
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -423,16 +429,15 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "val/bpb": val_bpb,
-        })
+            "eval/loss": val_loss,
+            "eval/bpb": val_bpb,
+            **progress,
+        }, step=step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -445,11 +450,10 @@ while True:
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
+            "eval/core_metric": results["core_metric"],
+            **{f"core/{task}": centered for task, centered in results["centered_results"].items()}, # per task, in a section of their own
+            **progress,
+        }, step=step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -491,7 +495,6 @@ while True:
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
                 },
             },
@@ -507,9 +510,10 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    loss_sum = 0 # for logging: this step's loss summed over its micro-batches
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
-        train_loss = loss.detach() # for logging
+        loss_sum = loss_sum + loss.detach()
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -538,6 +542,9 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
+    train_loss = loss_sum / grad_accum_steps # this step's mean loss over this rank's micro-batches
+    if is_ddp_initialized():
+        dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # and over the ranks: the mean loss of the whole batch
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -545,9 +552,6 @@ while True:
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
-    ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
@@ -564,20 +568,31 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-            "train/epoch": epoch,
-        }
-        wandb_run.log(log_data)
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    # parameter norms per optimizer group, in fp32 (the embeddings are stored in bf16); the Muon groups share "matrix"
+    param_sq = {}
+    for group in optimizer.param_groups:
+        group_sq = torch.stack([torch.linalg.vector_norm(p, dtype=torch.float32) for p in group["params"]]).square().sum()
+        param_sq[group["name"]] = param_sq.get(group["name"], 0) + group_sq
+    param_norms = dict(zip(param_sq, torch.stack(list(param_sq.values())).sqrt().tolist())) # one CPU-GPU sync
+    wandb_run.log({
+        "train/loss": train_loss_f,
+        **progress,
+        "throughput/tokens_per_second": tok_per_sec,
+        "throughput/gflops_per_second": flops_per_sec / 1e9,
+        "throughput/duration": dt,
+        "throughput/mfu": mfu,
+        "memory/peak_gib": get_max_memory() / 2**30, # the peak allocated since the run started (this rank's)
+        **{f"optim/lr/{group['name']}": group["lr"] for group in optimizer.param_groups}, # (the Muon groups share "matrix")
+        "optim/muon_momentum": muon_momentum,
+        "optim/muon_weight_decay": muon_weight_decay,
+        "grad/norm/total": optimizer.grad_norm.item(),
+        "params/norm/total": math.sqrt(sum(norm ** 2 for norm in param_norms.values())),
+        **{f"params/norm/{name}": norm for name, norm in param_norms.items()},
+        "data/epoch": dataloader_state_dict["epoch"],
+        "data/pq_idx": dataloader_state_dict["pq_idx"],
+        "data/rg_idx": dataloader_state_dict["rg_idx"],
+    }, step=step)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
