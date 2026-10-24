@@ -417,6 +417,12 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
+    # where the run is at this step, before its update: the x-axes of every log at this step (eval and training)
+    progress = {
+        "throughput/total_tokens": total_batch_size * step,
+        "throughput/total_gflops": flops_so_far / 1e9,
+        "throughput/total_training_time": total_training_time,
+    }
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -430,6 +436,7 @@ while True:
             min_val_bpb = val_bpb
         wandb_run.log({
             "eval/bpb": val_bpb,
+            **progress,
         }, step=step)
         model.train()
 
@@ -445,6 +452,7 @@ while True:
         wandb_run.log({
             "eval/core_metric": results["core_metric"],
             "eval/centered_results": results["centered_results"],
+            **progress,
         }, step=step)
         model.train()
 
@@ -565,10 +573,11 @@ while True:
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     wandb_run.log({
         "train/loss": step_loss_f,
-        "throughput/total_tokens": total_batch_size * (step + 1),
+        **progress,
         "throughput/tokens_per_second": tok_per_sec,
+        "throughput/gflops_per_second": flops_per_sec / 1e9,
+        "throughput/duration": dt,
         "throughput/mfu": mfu,
-        "throughput/total_training_time": total_training_time,
         **{f"optim/lr/{group['name']}": group["lr"] for group in optimizer.param_groups}, # (the Muon groups share "matrix")
         "optim/muon_momentum": muon_momentum,
         "optim/weight_decay": muon_weight_decay,
