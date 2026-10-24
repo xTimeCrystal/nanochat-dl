@@ -75,6 +75,7 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--log-every", type=int, default=1, help="log training metrics to wandb every N steps (0 = never)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -98,6 +99,8 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+# Every wandb_run.log below passes step=step, so wandb's own step (the default x-axis) is the training step. Otherwise it
+# counts log calls (train, val and CORE logs at different cadences put e.g. the step-750 val point at x=753).
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -432,7 +435,7 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }, step=step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -449,7 +452,7 @@ while True:
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
-        })
+        }, step=step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -507,9 +510,11 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    loss_sum = 0 # this step's loss summed over micro-batches (rank 0's data), for logging
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
+        loss_sum = loss_sum + train_loss
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -538,7 +543,7 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    train_loss_f, step_loss_f = torch.stack([train_loss, loss_sum / grad_accum_steps]).tolist() # one CPU-GPU sync point
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -565,19 +570,28 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    if args.log_every > 0 and step % args.log_every == 0:
+        # every metric of the step, at the step (see the wandb init above); master process only (others: dummy)
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
+            "train/loss": debiased_smooth_loss, # EMA (as printed)
+            "train/loss_step": step_loss_f, # this step's mean loss over its micro-batches, unsmoothed
+            "train/tokens": total_batch_size * (step + 1),
             "train/lrm": lrm,
+            "train/lr_matrix": args.matrix_lr * batch_lr_scale * lrm,
+            "train/muon_momentum": muon_momentum,
+            "train/muon_weight_decay": muon_weight_decay,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
-            "train/epoch": epoch,
+            "train/peak_mem_gib": get_max_memory() / 2**30,
+            "data/epoch": dataloader_state_dict["epoch"],
+            "data/pq_idx": dataloader_state_dict["pq_idx"],
+            "data/rg_idx": dataloader_state_dict["rg_idx"],
         }
-        wandb_run.log(log_data)
+        wandb_run.log(log_data, step=step)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
