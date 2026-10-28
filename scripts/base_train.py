@@ -53,6 +53,15 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--fbt-passes", type=int, default=1, help="FBT: trunk passes, each later one fed the previous pass's state at the position before (1 = off)")
+parser.add_argument("--think-latents", type=int, default=0, help="thinking tokens inside the FBT passes: latent positions after every real token (0 = off)")
+parser.add_argument("--think-schedule", type=str, default="grown", choices=["grown", "stream"], help="grown: pass s holds the latents of depth < s; stream: every pass holds every latent")
+parser.add_argument("--think-random", action="store_true", help="thinking tokens (stream): each token's thought count drawn uniformly from 0..--think-latents in training")
+parser.add_argument("--think-eval-passes", type=int, default=0, help="FBT passes when evaluating a thinking model (0 = --fbt-passes)")
+parser.add_argument("--kda-hybrid", action="store_true", help="Kimi K3's stack with MHA: 3 KDA layers per global NoPE attention layer (needs flash-linear-attention)")
+parser.add_argument("--attn-gate", action="store_true", help="Kimi K3's channel-wise sigmoid output gate on every attention layer (RoPE and windows unchanged)")
+parser.add_argument("--seed", type=int, default=42, help="the global seed (weight init; the data order is fixed); 42 = compute_init's")
+parser.add_argument("--kda-no-gate-params", action="store_true", help="KDA's decay without K3's per-head scale A and bias b: log alpha = -5 Sigmoid(W_up W_down x)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -85,6 +94,10 @@ user_config = vars(args).copy()  # for logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+if args.seed != 42: # (compute_init seeds 42; the model is initialized below)
+    torch.manual_seed(args.seed)
+    if device_type == "cuda":
+        torch.cuda.manual_seed(args.seed)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -138,7 +151,10 @@ def build_model_meta(depth):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+        window_pattern=args.window_pattern, fbt_passes=args.fbt_passes,
+        think_latents=args.think_latents, think_schedule=args.think_schedule, think_eval_passes=args.think_eval_passes,
+        think_random=args.think_random,
+        kda_hybrid=args.kda_hybrid, kda_gate_params=not args.kda_no_gate_params, attn_gate=args.attn_gate,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -458,7 +474,7 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    if args.sample_every > 0 and args.fbt_passes == 1 and not args.kda_hybrid and master_process and (last_step or (step > 0 and step % args.sample_every == 0)): # (FBT, KDA: no KV-cache sampler)
         model.eval()
         prompts = [
             "The capital of France is",

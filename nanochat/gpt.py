@@ -12,6 +12,7 @@ Notable features:
 - Flash Attention 3 integration
 """
 
+import math
 from functools import partial
 from dataclasses import dataclass
 
@@ -37,6 +38,28 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # FBT (dl_pro's full-bandwidth transformer): fbt_passes trunk passes, pass k on norm(W_t e + W_h norm(h)), h the
+    # previous pass's final state at the position before (h = 0 in pass 1 and at position 0); W_t = I, W_h = 0 at init.
+    # Training: the mean of the passes' losses; otherwise the last pass.
+    fbt_passes: int = 1
+    # Thinking tokens inside the FBT passes: think_latents latent positions after every real token, at its rotary position,
+    # their input the reserved token vocab_size. The position before a latent is the previous latent of its group (the
+    # first: its token), the one before a real token the previous token's last latent. "grown": pass s holds the latents of
+    # depth < s (needs fbt_passes >= think_latents + 2); "stream": every pass holds every latent. Every position predicts
+    # its token's next real token. Evaluation: every latent, think_eval_passes passes (0 = fbt_passes), read at each
+    # token's last latent.
+    think_latents: int = 0
+    think_schedule: str = "grown"
+    think_eval_passes: int = 0
+    # training (stream): each token's thought count drawn from 0..think_latents, uniformly (a shuffled balanced multiset per
+    # batch, so the stream length is fixed); evaluation: think_latents after every token
+    think_random: bool = False
+    think_eval_random: bool = False # (think_random at evaluation too: measuring the mixed counts)
+    # Kimi K3's attention stack (arXiv 2607.24653), with MHA in place of its MLA: every fourth layer and the last is global
+    # attention without positional encoding (NoPE, full context) and with a sigmoid output gate; the rest are KDA layers.
+    kda_hybrid: bool = False
+    attn_gate: bool = False # Kimi K3's sigmoid output gate on every attention layer (on with kda_hybrid; alone: RoPE, windows kept)
+    kda_gate_params: bool = True # KDA's decay with K3's per-head scale A and bias b; False: log alpha = -5 Sigmoid(W_up W_down x)
 
 
 def norm(x):
@@ -49,6 +72,10 @@ class Linear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
+
+def is_kda(layer_idx, config):
+    """Kimi K3 hybrid: 3 KDA layers then 1 global attention layer, the last layer always global."""
+    return config.kda_hybrid and layer_idx % 4 != 3 and layer_idx != config.n_layer - 1
 
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
@@ -80,6 +107,8 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.nope = config.kda_hybrid # (Kimi K3: no positional encoding, an output gate)
+        self.c_gate = Linear(self.n_embd, self.n_embd, bias=False) if config.kda_hybrid or config.attn_gate else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -98,7 +127,8 @@ class CausalSelfAttention(nn.Module):
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        if not self.nope:
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
@@ -124,8 +154,68 @@ class CausalSelfAttention(nn.Module):
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
+        if self.c_gate is not None: # channel-wise sigmoid output gate
+            y = torch.sigmoid(self.c_gate(x)) * y
         y = self.c_proj(y)
         return y
+
+
+class KimiDeltaAttention(nn.Module):
+    """Kimi K3's KDA layer (arXiv 2607.24653, eqs. 1-6; FLA's chunk_kda kernel). Per head the state
+    S_t = (I - beta_t k_t k_t^T) Diag(alpha_t) S_{t-1} + beta_t k_t v_t^T is read out as o_t = S_t^T q_t; q, k, v pass a short
+    causal convolution and Swish (q, k then L2-normed), beta_t = Sigmoid(W_beta x_t), the channel-wise decay is
+    log alpha_t = -5 Sigmoid(e^A (W_up W_down x_t + b)), and the output W_o [Sigmoid(W_g x_t) * RMSNorm(o_t)], head-wise.
+    The recurrence carries the positions (no RoPE)."""
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        C = config.n_embd
+        self.n_head, self.head_dim = config.n_head, C // config.n_head
+        self.ve_gate = None # (no value embeddings)
+        self.c_q = Linear(C, C, bias=False)
+        self.c_k = Linear(C, C, bias=False)
+        self.c_v = Linear(C, C, bias=False)
+        self.conv_q, self.conv_k, self.conv_v = (nn.Parameter(torch.empty(C, 1, 4)) for _ in range(3)) # depthwise, width 4
+        self.c_decay_down = Linear(C, self.head_dim, bias=False) # low-rank decay logit
+        self.c_decay_up = Linear(self.head_dim, C, bias=False)
+        self.gate_params = config.kda_gate_params
+        if self.gate_params:
+            self.A_log = nn.Parameter(torch.empty(self.n_head)) # per-head log-scale A
+            self.dt_bias = nn.Parameter(torch.empty(C)) # the decay logit's bias b
+        self.c_beta = Linear(C, self.n_head, bias=False)
+        self.c_gate = Linear(C, C, bias=False) # full-rank output gate
+        self.c_proj = Linear(C, C, bias=False)
+
+    @torch.no_grad()
+    def init_weights(self, s):
+        """(c_q / c_k / c_v / c_proj / c_gate: GPT.init_weights.) A = 0 and the bias as Mamba-2's / GDN's / Kimi Linear's (inverse
+        softplus of dt ~ log-uniform [0.001, 0.1]); the convolutions as PyTorch's Conv1d default."""
+        for w in (self.conv_q, self.conv_k, self.conv_v):
+            torch.nn.init.uniform_(w, -0.5, 0.5)
+        for lin in (self.c_decay_down, self.c_beta):
+            torch.nn.init.uniform_(lin.weight, -s, s)
+        torch.nn.init.uniform_(self.c_decay_up.weight, -(3 / self.head_dim) ** 0.5, (3 / self.head_dim) ** 0.5)
+        if self.gate_params:
+            torch.nn.init.zeros_(self.A_log)
+            dt = torch.exp(torch.rand_like(self.dt_bias) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=1e-4)
+            self.dt_bias.copy_(dt + torch.log(-torch.expm1(-dt)))
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        assert kv_cache is None, "KDA has no KV-cache inference path"
+        from fla.ops.kda import chunk_kda
+        B, T, C = x.size()
+        def conv(y, w): # causal depthwise convolution over time, then Swish
+            return F.silu(F.conv1d(F.pad(y.transpose(1, 2), (w.size(-1) - 1, 0)), w.to(y.dtype), groups=C)).transpose(1, 2)
+        shape = (B, T, self.n_head, self.head_dim)
+        q, k, v = (conv(lin(x), w).reshape(shape) for lin, w in ((self.c_q, self.conv_q), (self.c_k, self.conv_k), (self.c_v, self.conv_v)))
+        g = self.c_decay_up(self.c_decay_down(x)).view(shape)
+        beta = torch.sigmoid(self.c_beta(x))
+        if self.gate_params:
+            o, _ = chunk_kda(q, k, v, g, beta, A_log=self.A_log, dt_bias=self.dt_bias, use_qk_l2norm_in_kernel=True,
+                             use_gate_in_kernel=True, safe_gate=True, lower_bound=-5.0)
+        else: # (the decay computed here, in the kernel's range [-5, 0))
+            o, _ = chunk_kda(q, k, v, -5.0 * torch.sigmoid(g.float()), beta, use_qk_l2norm_in_kernel=True, safe_gate=True,
+                             lower_bound=-5.0)
+        return self.c_proj(torch.sigmoid(self.c_gate(x)) * norm(o).view(B, T, C))
 
 
 class MLP(nn.Module):
@@ -144,7 +234,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = (KimiDeltaAttention if is_kda(layer_idx, config) else CausalSelfAttention)(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
@@ -167,7 +257,7 @@ class GPT(nn.Module):
         self.window_sizes = self._compute_window_sizes(config)
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
-        padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
+        padded_vocab_size = ((config.vocab_size + (config.think_latents > 0) + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to # (+1: the latents' token)
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         self.transformer = nn.ModuleDict({
@@ -175,6 +265,9 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        if config.fbt_passes > 1: # FBT fusion of the token input with the fed-back state
+            self.fbt_t = Linear(config.n_embd, config.n_embd, bias=False)
+            self.fbt_h = Linear(config.n_embd, config.n_embd, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -189,7 +282,7 @@ class GPT(nn.Module):
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer) and not is_kda(i, config)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -248,6 +341,18 @@ class GPT(nn.Module):
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
+
+        # FBT fusion: identity on the token, zero on the fed-back state (every pass starts as the plain trunk)
+        if self.config.fbt_passes > 1:
+            torch.nn.init.eye_(self.fbt_t.weight)
+            torch.nn.init.zeros_(self.fbt_h.weight)
+
+        # Kimi K3 hybrid: the output gates (init like c_q), KDA's convolutions, decay and write strength
+        for block in self.transformer.h:
+            if block.attn.c_gate is not None:
+                torch.nn.init.uniform_(block.attn.c_gate.weight, -s, s)
+            if isinstance(block.attn, KimiDeltaAttention):
+                block.attn.init_weights(s)
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
@@ -311,6 +416,8 @@ class GPT(nn.Module):
             window_sizes.append(char_to_window[char])
         # Final layer always gets full context
         window_sizes[-1] = (long_window, 0)
+        if config.kda_hybrid: # (Kimi K3: the attention layers are global; KDA has no window)
+            window_sizes = [(long_window, 0)] * config.n_layer
         return window_sizes
 
     def get_device(self):
@@ -335,7 +442,7 @@ class GPT(nn.Module):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
+        num_flops_per_token = (6 * self.num_matmul_params() + attn_flops) * self.config.fbt_passes * (1 + self.config.think_latents) # (FBT, thoughts: every pass, every position)
         return num_flops_per_token
 
     def num_matmul_params(self):
@@ -405,7 +512,8 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        fbt = sum(p.numel() for n, p in self.named_parameters() if n.startswith("fbt_")) # (apart: the token budget stays the baseline's)
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + fbt
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -413,6 +521,7 @@ class GPT(nn.Module):
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
+            'fbt': fbt,
             'total': total,
         }
 
@@ -420,14 +529,17 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in self.transformer.h.parameters() if p.ndim == 2]
+        kda_params = [p for p in self.transformer.h.parameters() if p.ndim != 2] # (KDA's convolutions, A, decay bias)
+        if self.config.fbt_passes > 1: # FBT fusion matrices on Muon
+            matrix_params += [self.fbt_t.weight, self.fbt_h.weight]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(kda_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -443,6 +555,8 @@ class GPT(nn.Module):
             dict(kind='adamw', name='x0', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', name='smear', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if kda_params:
+            param_groups.append(dict(kind='adamw', name='kda', params=kda_params, lr=0.004, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -493,7 +607,52 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
-        # Forward the trunk of the Transformer
+        if self.config.fbt_passes > 1:
+            assert kv_cache is None, "FBT has no KV-cache inference path"
+            return self._fbt(x, idx, targets, loss_reduction, logit_positions)
+        x = self._trunk(x, idx, cos_sin, kv_cache, self.window_sizes)
+        return self._head(x, targets, loss_reduction, logit_positions)
+
+    def _fbt(self, x, idx, targets, loss_reduction, logit_positions):
+        """The FBT passes over the stream of real tokens and their latents (GPTConfig.fbt_passes, think_*; no latents:
+        plain FBT). x (B, T, C): the real tokens' normed, smeared embedding."""
+        c, (B, T) = self.config, idx.shape
+        training = targets is not None and self.training
+        passes = c.think_eval_passes if c.think_eval_passes and not training else c.fbt_passes
+        x_think = norm(self.transformer.wte.weight[c.vocab_size].to(x.dtype)) if c.think_latents else None
+        losses, prev = [], None
+        L, ar = c.think_latents, torch.arange(T, device=idx.device)
+        rand = c.think_random and (training or c.think_eval_random)
+        if rand: # (one draw for every pass: the stream schedule)
+            assert c.think_schedule == "stream", "think_random draws the counts of the stream schedule"
+            rand_cnt, rand_n = (ar % (L + 1))[torch.randperm(T, device=idx.device)], T + sum(i % (L + 1) for i in range(T))
+        for s in range(1, passes + 1):
+            d = min(s - 1, L) if training and c.think_schedule == "grown" else L
+            # the stream: each real token followed by cnt latents; owner = the token's index (its rotary position), kind 0 the
+            # real token and j its j-th latent, start = each group's real position
+            cnt, n = (rand_cnt, rand_n) if rand else (torch.full_like(ar, d), T * (d + 1))
+            start = torch.cumsum(cnt + 1, 0) - (cnt + 1)
+            owner = torch.repeat_interleave(ar, cnt + 1, output_size=n)
+            kind = torch.arange(n, device=idx.device) - start[owner]
+            real = kind == 0
+            e = torch.where(real[:, None], x[:, owner], x_think) if n > T else x
+            h = torch.zeros_like(e)
+            if prev is not None: # the previous pass's state of the position before: a latent's the previous position of its
+                # group, a real token's the previous token's last position (token 0: none, h = 0)
+                h_prev, start_prev, cnt_prev = prev
+                before = (owner - 1).clamp(min=0)
+                src = torch.where(real, start_prev[before] + cnt_prev[before], start_prev[owner] + kind - 1)
+                h = h_prev[:, src] * ((owner > 0) | ~real)[:, None].to(h.dtype)
+            ids = torch.where(real, idx[:, owner], c.vocab_size) # (the latents' value embeddings: the reserved token's)
+            h = self._trunk(norm(self.fbt_t(e) + self.fbt_h(norm(h))), ids, (self.cos[:, owner], self.sin[:, owner]), None,
+                            [(w * n // T, r) for w, r in self.window_sizes]) # (windows count real tokens)
+            if training:
+                losses.append(self._head(h, targets[:, owner], loss_reduction))
+            prev = (h, start, cnt)
+        return torch.stack(losses).mean() if training else self._head(h[:, start + cnt], targets, loss_reduction, logit_positions)
+
+    def _trunk(self, x, idx, cos_sin, kv_cache, window_sizes):
+        """The transformer blocks on the input x (B, T, C): the final normed hidden state."""
         x0 = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
@@ -501,13 +660,16 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+        return norm(x)
+
+    def _head(self, x, targets, loss_reduction, logit_positions=None):
+        """The logits of the final hidden state x, or the loss when targets are given (at logit_positions only, if given)."""
         if logit_positions is not None:
             x = x[:, logit_positions]
             targets = None if targets is None else targets[:, logit_positions]
