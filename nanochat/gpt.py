@@ -18,9 +18,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
+from nanochat.moe import K3MoE
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
@@ -37,6 +39,13 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Mixture of Experts in place of each MLP (nanochat/moe.py). 0 experts = the dense MLP. One shared expert plus top_k
+    # routed ones are active per token; their hidden widths should add up to the dense MLP's 4 * n_embd (its FLOPs), e.g.
+    # at d16 with top-6 a shared 1024 and routed 512. 0 = an even split, 4 * n_embd / (top_k + 1) each.
+    num_experts: int = 0
+    top_k: int = 2
+    expert_hidden: int = 0 # of a routed expert
+    shared_hidden: int = 0 # of the shared one
 
 
 def norm(x):
@@ -141,11 +150,19 @@ class MLP(nn.Module):
         return x
 
 
+def moe_mlp(config):
+    # the shared expert + top_k routed ones = the dense 4x MLP's hidden units. Given widths (expert_hidden, shared_hidden),
+    # or by default an even split over the top_k + 1, rounded down to a multiple of 16 (the GEMMs are several times slower
+    # on a width that is not)
+    even = 4 * config.n_embd // (config.top_k + 1) // 16 * 16
+    return K3MoE(config.n_embd, config.num_experts, config.top_k, config.expert_hidden or even, config.shared_hidden or even)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = moe_mlp(config) if config.num_experts else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -228,6 +245,16 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if isinstance(block.mlp, K3MoE): # every expert like the dense MLP; the router like the other projections
+                torch.nn.init.uniform_(block.mlp.router, -s, s)
+                torch.nn.init.uniform_(block.mlp.wu, -s * 0.4, s * 0.4)
+                torch.nn.init.uniform_(block.mlp.shared_up, -s * 0.4, s * 0.4)
+                torch.nn.init.zeros_(block.mlp.wd)
+                torch.nn.init.zeros_(block.mlp.shared_down)
+                block.mlp.bias.zero_()
+                block.mlp.load.zero_()
+                block.mlp.counts.zero_()
+                continue
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -346,7 +373,28 @@ class GPT(nn.Module):
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
         """
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        # MoE: the router, the shared expert and the top_k routed experts a token goes through
+        matmul_params += sum(m.router.numel() for m in self.moes()) + self.num_active_expert_params()
         return matmul_params
+
+    def moes(self):
+        return [block.mlp for block in self.transformer.h if isinstance(block.mlp, K3MoE)]
+
+    def num_active_expert_params(self):
+        """Expert parameters a token goes through: the shared expert and top_k of the routed ones."""
+        routed = lambda m: (m.wu.numel() + m.wd.numel()) * m.top_k // m.wu.shape[0]
+        return sum(m.shared_up.numel() + m.shared_down.numel() + routed(m) for m in self.moes())
+
+    def pop_moe_stats(self):
+        """Every expert's load since the last call, relative to an even split (layers, experts), pooled over the
+        micro-batches and the ranks, then reset. Every rank has to call it (one all-reduce)."""
+        moes = self.moes()
+        load = torch.stack([m.load for m in moes])
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(load)
+        for m in moes:
+            m.load.zero_()
+        return load / load.mean(1, keepdim=True).clamp_min(1)
 
     def estimate_decode_flops(self, context_len):
         """
@@ -406,12 +454,17 @@ class GPT(nn.Module):
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        # what a token goes through, the router aside: equal to transformer_matrices for a dense model, and to those of
+        # the dense model of the same FLOPs for an MoE (the training horizon and its hyperparameters follow this one)
+        expert_params = sum(sum(p.numel() for p in m.parameters()) for m in self.moes())
+        active_matrices = transformer_matrices - expert_params + self.num_active_expert_params()
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'active_matrices': active_matrices,
             'scalars': scalars,
             'total': total,
         }
@@ -420,7 +473,7 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = list(self.transformer.h.parameters()) # (an MoE's router included: under AdamW at the lm_head's rate its scores saturated within 40 steps)
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -443,7 +496,7 @@ class GPT(nn.Module):
             dict(kind='adamw', name='x0', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', name='smear', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
+        # Muon groups (matrix params, grouped by shape for stacking; an expert stack (E, out, in) is E matrices)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(

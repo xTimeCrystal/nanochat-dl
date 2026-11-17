@@ -52,6 +52,10 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
+parser.add_argument("--num-experts", type=int, default=0, help="routed experts per layer in place of the MLP, at the MLP's FLOPs (0 = dense MLP)")
+parser.add_argument("--top-k", type=int, default=2, help="routed experts active per token (plus one shared expert)")
+parser.add_argument("--expert-hidden", type=int, default=0, help="MoE: hidden width of a routed expert (0 = 4 * n_embd / (top_k + 1))")
+parser.add_argument("--shared-hidden", type=int, default=0, help="MoE: hidden width of the shared expert (0 = the even split 4 * n_embd / (top_k + 1))")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -128,8 +132,9 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
+def build_model_meta(depth, dense=False):
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data). dense: without the MoE, for the
+    reference model the hyperparameter scalings are relative to."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
@@ -139,6 +144,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        num_experts=0 if dense else args.num_experts, top_k=args.top_k, expert_hidden=args.expert_hidden, shared_hidden=args.shared_hidden,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -265,13 +271,14 @@ print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 def get_scaling_params(m):
     # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
     params_counts = m.num_scaling_params()
-    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
+    scaling_params = params_counts['active_matrices'] + params_counts['lm_head'] # (active: an MoE trains like the dense model of its FLOPs)
     return scaling_params
 num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+# (always the dense d12: an MoE, whatever its expert widths, trains with the hyperparameters of the dense model of its FLOPs)
+d12_ref = build_model_meta(12, dense=True) # creates the model on meta device
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
@@ -568,6 +575,13 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    moe_log = {}
+    if orig_model.moes(): # tokens per expert relative to an even split, pooled over this step's micro-batches and ranks
+        load = orig_model.pop_moe_stats() # (layers, experts)
+        stats = torch.cat([torch.stack([load.min(), load.max(), load.std(dim=1).mean()]), load.amax(dim=1)]).tolist() # one sync
+        moe_log = {"moe/load_min": stats[0], "moe/load_max": stats[1], "moe/load_cv": stats[2], # extremes over all layers; std / mean, averaged over layers
+                   **{f"moe_layers/load_max_{i:02d}": v for i, v in enumerate(stats[3:])}}
+        eta_str += f" | expert load: {stats[0]:.2f}-{stats[1]:.2f} cv {stats[2]:.3f}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     # parameter norms per optimizer group, in fp32 (the embeddings are stored in bf16); the Muon groups share "matrix"
     param_sq = {}
@@ -587,6 +601,7 @@ while True:
         "optim/muon_momentum": muon_momentum,
         "optim/muon_weight_decay": muon_weight_decay,
         "grad/norm/total": optimizer.grad_norm.item(),
+        **moe_log,
         "params/norm/total": math.sqrt(sum(norm ** 2 for norm in param_norms.values())),
         **{f"params/norm/{name}": norm for name, norm in param_norms.items()},
         "data/epoch": dataloader_state_dict["epoch"],
