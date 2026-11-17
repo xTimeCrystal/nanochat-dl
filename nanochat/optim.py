@@ -20,8 +20,7 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-# The fused steps below compile one variant per parameter shape (dynamic=False). An MoE's expert stacks add several shapes,
-# and with fullgraph=True Dynamo's default limit of 8 variants is a hard failure at the first step, not a fallback
+# the fused steps compile once per parameter shape; an MoE adds shapes past Dynamo's default limit of 8 (fullgraph: a hard error)
 torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
 
 
@@ -389,7 +388,7 @@ class MuonAdamW(torch.optim.Optimizer):
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
-            # (leading dimensions of a param, e.g. the experts of an (E, out, in) stack, are a batch of matrices)
+            # (leading dims, e.g. an MoE's experts, are a batch of matrices)
             state_shape = (chunk_size, *shape[:-1], 1) if shape[-2] >= shape[-1] else (chunk_size, *shape[:-2], 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
