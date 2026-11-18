@@ -381,19 +381,26 @@ class _Lead(torch.autograd.Function):
         return None, dU, None, None, None, *((None,) * ctx.n_members), *part.unbind(0)
 
 
+def _mix_ops(U, i, nb, acc, mx, sm, n_dir, norm_keys, norm_out, vs):
+    """Mixture i of the sources vs (the last n_dir, 0 or 1, is the running sum; the others are kept ones).
+    Without a state (acc, mx, sm): one pass over vs, which also leaves the states of the next nb - 1 mixtures over the
+    kept ones. With a state: continued from it over vs, the sources added since. Returns y, S and those states."""
+    if acc is None:
+        y, S, *states = torch.ops.attn_res.mix(vs, U[i:i + nb], len(vs) - n_dir, norm_keys, norm_out)
+    else:
+        y, S = torch.ops.attn_res.mix_from(vs, U[i], acc, mx, sm, norm_keys, norm_out)
+        states = []
+    return y, S, states
+
+
 class _Mix(torch.autograd.Function):
-    """Mixture i. Without a state (acc, mx, sm): one pass over its sources, which also leaves the states of the next
-    nb - 1 mixtures over the kept ones. With a state: continued from it over the sources added since.
-    args: the n_src sources read now (the kept ones detached: their gradients go through their tokens; the last n_dir,
-    0 or 1, is the running sum, differentiated here), then this mixture's tokens. Returns its output and the states."""
+    """Mixture i with its backward (see _mix_ops). args: the n_src sources read now (the kept ones detached: their
+    gradients go through their tokens; the running sum is differentiated here), then this mixture's tokens.
+    Returns its output and the states."""
 
     @staticmethod
     def forward(ctx, U, q, i, nb, acc, mx, sm, n_src, n_dir, norm_keys, norm_out, *args):
-        vs, states = list(args[:n_src]), []
-        if acc is None:
-            y, S, *states = torch.ops.attn_res.mix(vs, U[i:i + nb], n_src - n_dir, norm_keys, norm_out)
-        else:
-            y, S = torch.ops.attn_res.mix_from(vs, U[i], acc, mx, sm, norm_keys, norm_out)
+        y, S, states = _mix_ops(U, i, nb, acc, mx, sm, n_dir, norm_keys, norm_out, list(args[:n_src]))
         n_tok = (len(args) - n_src) // 2
         ctx.mark_non_differentiable(*states)
         # Without tokens there is no kept source: the running sum is the only source, its gradient is G, and it is not needed.
@@ -481,10 +488,12 @@ class _Stream:
                 nb, state, vs = 1, self.ahead.pop(0), self.kept[self.seen:] + self.direct
             else:  # a pass over every source; it also leaves the states of the next mixtures over the kept ones
                 nb, state, vs = (min(BLOCK, len(self.U) - i) if self.kept else 1), (None, None, None), self.kept + self.direct
-            args = (self.U, next(self.q, None), i, nb, *state, len(vs), len(self.direct), self.norm_keys, self.norm_out[i],
-                    *vs, *self.g_tokens[i], *self.p_tokens[i])
-            # A checkpoint: the output is rebuilt from the sources in the backward instead of being saved.
-            y, *states = torch.utils.checkpoint.checkpoint(_Mix.apply, *args, use_reentrant=False)
+            if self.grad:  # a checkpoint: the output is rebuilt from the sources in the backward instead of being saved
+                args = (self.U, next(self.q), i, nb, *state, len(vs), len(self.direct), self.norm_keys, self.norm_out[i],
+                        *vs, *self.g_tokens[i], *self.p_tokens[i])
+                y, *states = torch.utils.checkpoint.checkpoint(_Mix.apply, *args, use_reentrant=False)
+            else:  # no gradient: the kernels alone (torch.compile cannot trace a checkpoint under no_grad)
+                y, _, states = _mix_ops(self.U, i, nb, *state, len(self.direct), self.norm_keys, self.norm_out[i], vs)
             if states:  # after a pass: one state per next mixture (row selects: the compiler saves unbind's rows)
                 self.ahead, self.seen = [[s[r] for s in states] for r in range(len(states[0]))], len(self.kept)
         self.i = i + 1
