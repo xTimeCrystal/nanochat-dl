@@ -57,6 +57,7 @@ parser.add_argument("--num-experts-per-token", type=int, default=None, help="MoE
 parser.add_argument("--moe-intermediate-size", type=int, default=None, help="MoE: hidden width of one expert (required with experts)")
 parser.add_argument("--num-shared-experts", type=int, default=None, help="MoE: shared experts, each moe-intermediate-size wide (required with experts; 0 = none)")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--attn-res", action="store_true", help="Attention Residuals: every sublayer reads a softmax-over-depth mixture of all earlier outputs instead of a residual stream")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -150,7 +151,7 @@ def build_model_meta(depth, dense=False):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+        window_pattern=args.window_pattern, attn_res=args.attn_res,
         num_experts=0 if dense else args.num_experts, num_experts_per_token=args.num_experts_per_token,
         moe_intermediate_size=args.moe_intermediate_size, num_shared_experts=args.num_shared_experts,
     )

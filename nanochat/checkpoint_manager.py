@@ -28,6 +28,8 @@ def _patch_missing_config_keys(model_config_kwargs):
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
+    if getattr(model_config, "attn_res", False): # (AttnRes models have neither: no residual stream)
+        return
     n_layer = model_config.n_layer
     # resid_lambdas defaults to 1.0 (identity scaling)
     if "resid_lambdas" not in model_data:
