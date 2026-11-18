@@ -17,19 +17,24 @@ starts: the indices of the blocks whose output starts a new source.
 - (), never: one sum, the input included, so every mixture has a single source and is its norm: the pre-norm residual
   stream x = x + block(norm(x)), at that stream's cost (the kernels then are an RMSNorm and its backward).
 The input stays outside: a caller builds it as it likes (a Full Bandwidth Transformer's feedback input) and may run the
-backbone any number of times per step, gradients flowing through every run. A block can itself be a backbone.
+backbone any number of times per step, gradients flowing through every run. The first block reads it as it is, so it is
+kept for that block's backward like any block input (a caller whose blocks are checkpoints builds it inside one too).
+A block can itself be a backbone.
 
 On CUDA with bf16 activations the mixtures run in Triton kernels (plain PyTorch elsewhere). What they cost grows with
 the number of kept sources, not of blocks:
 - memory: every source is kept once (the block's output itself, or the running sum). Eager, a mixture keeps its output
-  (the next block's input anyway) and, if it read kept sources, two floats per token; compiled, it is a checkpoint and
-  keeps nothing: its output is rebuilt from the sources in the backward.
+  (the next block's input anyway) and two floats per token; compiled, it is a checkpoint and keeps nothing: its output
+  is rebuilt from the sources in the backward.
 - forward: the pseudo-queries are known in advance, so one pass over the kept sources completes a mixture and leaves the
   online-softmax state (bf16 sum, running max and sum) of the next BLOCK - 1; each of those then reads its state and the
   sources added since.
-- backward: a source that one mixture alone reads (a running sum that goes on) gets its gradient from that mixture
-  directly. A kept source collects it from the mixtures that read it: BLOCK consecutive ones form a group, and from the
-  next mixture on one lead node stands in for the group, reading each later mixture's gradient once for all of them.
+- backward: a mixture's own backward reads its output and that output's gradient only; with a single source that is
+  already the source's gradient (an RMSNorm backward), and the compiler stays free to recompute a running sum instead
+  of keeping it. A source that one mixture alone reads beside kept ones gets its gradient from that mixture directly.
+  A kept source collects it from the mixtures that read it: BLOCK consecutive kept sources form a group, and from the
+  first mixture that reads them all on, one lead node stands in for the group, reading each later mixture's gradient
+  once for all of them.
 """
 
 from types import SimpleNamespace
@@ -48,8 +53,8 @@ except ImportError: # no Triton (CPU / MPS): the kernels below are never launche
 
 EPS = torch.finfo(torch.float32).eps
 BLOCK = 4  # mixtures per forward pass over the kept sources, and kept sources per backward group (2: a few (M, C) tensors less in flight, 1-2 % slower)
-TILE = dict(elems=1024, num_warps=1)  # elements and warps per program: _mix, _fwd, _bwd, _bwd_src (bandwidth-bound at any tile)
-LEAD_TILE = dict(elems=1024, num_warps=4)  # _bwd_lead (an accumulator per source and row)
+TILE = dict(per_warp=1024, min_warps=1)  # elements of a row per warp, and the fewest warps per program: _mix, _fwd, _bwd, _bwd_src
+LEAD_TILE = dict(per_warp=512, min_warps=2)  # _bwd_lead (it also holds its BLOCK sources)
 
 
 @triton.jit
@@ -58,36 +63,37 @@ def _rstd(v, eps, C: tl.constexpr):
 
 
 @triton.jit
-def _mix(SRC, U, Y, S, ACC, MX, SM, M, K, KS, NB, eps, C: tl.constexpr, NBP: tl.constexpr, HAS_S: tl.constexpr,
-         BLOCK_C: tl.constexpr, BLOCK_M: tl.constexpr):
+def _mix(SRC, U, Y, S, ACC, MX, SM, M, K, KS, NB, eps, C: tl.constexpr, NBP: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_M: tl.constexpr):
     """One pass over the K sources of the pointer table SRC for NB mixtures (queries U[0..NB-1]). Mixture 0, over all of
-    them: Y = norm(h) and, if HAS_S (KS > 0: it reads kept sources), S = (logsumexp, rstd(h)) per token. Mixtures 1..NB-1: their online-softmax
-    state over the first KS sources (ACC[b-1] = sum_k exp(s_bk - MX[b-1]) v_k in bf16; MX, SM: the running max and sum)."""
+    them: Y = norm(h) and S = (logsumexp, rstd(h)) per token. Mixtures 1..NB-1: their online-softmax state over the first
+    KS sources, the kept ones (ACC[b-1] = sum_k exp(s_bk - MX[b-1]) v_k in bf16; MX, SM: the running max and sum)."""
     rm = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     rc = tl.arange(0, BLOCK_C)
     rb = tl.arange(0, NBP)
     mm, mc, mb = rm < M, rc < C, rb < NB
     mask = mm[:, None] & mc[None, :]
-    u = tl.load(U + rb[:, None] * C + rc[None, :], mask=mb[:, None] & mc[None, :], other=0.0)
     m_i = tl.full([NBP, BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([NBP, BLOCK_M], tl.float32)
     acc = tl.zeros([NBP, BLOCK_M, BLOCK_C], tl.float32)
     for k in range(K):
         v = tl.load(tl.load(SRC + k).to(tl.pointer_type(tl.bfloat16)) + rm[:, None] * C + rc[None, :], mask=mask, other=0.0).to(tl.float32)
-        s = libdevice.mul_rn(tl.sum(v[None, :, :] * u[:, None, :], 2), _rstd(v, eps, C)[None, :])  # (a rounded product, no FMA: the backward recomputes it bitwise)
-        m_new = tl.maximum(m_i, s)
-        a, b = tl.exp(m_i - m_new), tl.exp(s - m_new)
+        uv = tl.zeros([NBP, BLOCK_M], tl.float32)
+        for b in tl.static_range(NBP):  # a query at a time: an (NBP, C) product at once does not fit a thread's registers
+            u = tl.load(U + b * C + rc, mask=mc & (b < NB), other=0.0)
+            uv = tl.where((rb == b)[:, None], tl.sum(v * u[None, :], 1)[None, :], uv)
+        s = libdevice.mul_rn(uv, _rstd(v, eps, C)[None, :])  # (a rounded product, no FMA: the backward recomputes it bitwise)
         upd = ((rb == 0) | (k < KS))[:, None]
-        acc = tl.where(upd[:, :, None], acc * a[:, :, None] + b[:, :, None] * v[None, :, :], acc)
-        l_i = tl.where(upd, l_i * a + b, l_i)
-        m_i = tl.where(upd, m_new, m_i)
+        m_new = tl.where(upd, tl.maximum(m_i, s), m_i)
+        a, b = tl.where(upd, tl.exp(m_i - m_new), 1.0), tl.where(upd, tl.exp(s - m_new), 0.0)  # (a mixture that does not read this source: 1 and 0)
+        acc = acc * a[:, :, None] + b[:, :, None] * v[None, :, :]
+        l_i = l_i * a + b
+        m_i = m_new
     first = (rb == 0)[:, None]
     m0, l0 = tl.sum(tl.where(first, m_i, 0.0), 0), tl.sum(tl.where(first, l_i, 0.0), 0)
     h = tl.sum(tl.where(first[:, :, None], acc, 0.0), 0) / l0[:, None]
     rstd = _rstd(h, eps, C)
-    if HAS_S:
-        tl.store(S + rm * 2, m0 + tl.log(l0), mask=mm)
-        tl.store(S + rm * 2 + 1, rstd, mask=mm)
+    tl.store(S + rm * 2, m0 + tl.log(l0), mask=mm)
+    tl.store(S + rm * 2 + 1, rstd, mask=mm)
     tl.store(Y + rm[:, None] * C + rc[None, :], (h * rstd[:, None]).to(tl.bfloat16), mask=mask)
     rest = (rb >= 1) & mb
     ob = tl.maximum(rb - 1, 0).to(tl.int64)
@@ -123,47 +129,35 @@ def _fwd(SRC, U, Y, S, ACC, MX, SM, M, K, eps, C: tl.constexpr, BLOCK_C: tl.cons
 
 
 @triton.jit
-def _bwd(DY, Y, S, D, U, G, P, DD, W, M, eps, C: tl.constexpr, HAS_D: tl.constexpr, HAS_G: tl.constexpr,
-         BLOCK_C: tl.constexpr, BLOCK_M: tl.constexpr):
-    """A mixture's backward from its output y: dh = rstd (dy - y (dy . y) / C); no kept source is read.
-    HAS_G (it read kept sources): G = dh (bf16) and P = (logsumexp, G . h), for their backward (_bwd_src, _bwd_lead).
-    HAS_D (its newest source D has no other reader): that source's gradient DD and, with kept sources, W = g r
-    (du = W @ d). Without kept sources h = d: DD is the RMSNorm backward, and S (nothing was saved) is not read."""
+def _bwd(DY, Y, S, D, U, G, P, DD, W, M, eps, C: tl.constexpr, HAS_D: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_M: tl.constexpr):
+    """A mixture's backward from its output y, no kept source read: G = dh = rstd (dy - y (dy . y) / C) (bf16) and
+    P = (logsumexp, G . h), for its kept sources' backward (_bwd_src, _bwd_lead). A mixture of one source: G is that
+    source's gradient (the RMSNorm backward). HAS_D (its newest source D has no other reader, and it read kept sources
+    too): that source's gradient DD and W = g r (du = W @ d)."""
     rm = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     rc = tl.arange(0, BLOCK_C)
     mm, mc = rm < M, rc < C
     mask = mm[:, None] & mc[None, :]
     dy = tl.load(DY + rm[:, None] * C + rc[None, :], mask=mask, other=0.0).to(tl.float32)
     y = tl.load(Y + rm[:, None] * C + rc[None, :], mask=mask, other=0.0).to(tl.float32)
-    if HAS_D:
-        d = tl.load(D + rm[:, None] * C + rc[None, :], mask=mask, other=0.0).to(tl.float32)
-    else:
-        d = y
-    u = tl.load(U + rc, mask=mc, other=0.0)
-    r = _rstd(d, eps, C)
-    uv = tl.sum(d * u[None, :], 1)
-    if HAS_G:
-        lse = tl.load(S + rm * 2, mask=mm, other=0.0)
-        rstd = tl.load(S + rm * 2 + 1, mask=mm, other=1.0)
-    else:  # h = d: its logit is the logsumexp, its rstd h's
-        lse = libdevice.mul_rn(uv, r)
-        rstd = r
+    lse = tl.load(S + rm * 2, mask=mm, other=0.0)
+    rstd = tl.load(S + rm * 2 + 1, mask=mm, other=1.0)
     dh = (rstd[:, None] * (dy - y * (tl.sum(dy * y, 1) / C)[:, None])).to(tl.bfloat16)
     dhf = dh.to(tl.float32)
-    if HAS_G:
-        c = tl.sum(dhf * y, 1) / rstd
-        tl.store(G + rm[:, None] * C + rc[None, :], dh, mask=mask)
-        tl.store(P + rm * 2, lse, mask=mm)
-        tl.store(P + rm * 2 + 1, c, mask=mm)
-    else:
-        c = tl.sum(dhf * d, 1)
-    if HAS_D:  # (alone, alpha = 1 and g = 0 exactly: dd = dh)
+    c = tl.sum(dhf * y, 1) / rstd
+    tl.store(G + rm[:, None] * C + rc[None, :], dh, mask=mask)
+    tl.store(P + rm * 2, lse, mask=mm)
+    tl.store(P + rm * 2 + 1, c, mask=mm)
+    if HAS_D:
+        d = tl.load(D + rm[:, None] * C + rc[None, :], mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(U + rc, mask=mc, other=0.0)
+        r = _rstd(d, eps, C)
+        uv = tl.sum(d * u[None, :], 1)
         alpha = tl.exp(libdevice.mul_rn(uv, r) - lse)  # the forward's softmax weight
         g = alpha * (tl.sum(dhf * d, 1) - c)
         dd = alpha[:, None] * dhf + g[:, None] * (r[:, None] * u[None, :] - (r * r * r * uv / C)[:, None] * d)
         tl.store(DD + rm[:, None] * C + rc[None, :], dd.to(tl.bfloat16), mask=mask)
-        if HAS_G:
-            tl.store(W + rm, (g * r).to(tl.bfloat16), mask=mm)
+        tl.store(W + rm, (g * r).to(tl.bfloat16), mask=mm)
 
 
 @triton.jit
@@ -228,9 +222,11 @@ def _bwd_lead(VT, GT, PT, U, PART, W, M, N, NB, eps, C: tl.constexpr, NBP: tl.co
 
 
 def _grid(M, C, tile):
+    """A program takes whole rows (1024 elements, or one row if wider), with warps in proportion to the row's width:
+    too few and a thread's registers overflow (16x slower at 2048 channels), too many and the row sums cross warps."""
     bc = triton.next_power_of_2(C)
-    bm = max(1, min(64, tile["elems"] // bc))
-    return (triton.cdiv(M, bm),), dict(BLOCK_C=bc, BLOCK_M=bm, num_warps=tile["num_warps"])
+    bm = max(1, 1024 // bc)
+    return (triton.cdiv(M, bm),), dict(BLOCK_C=bc, BLOCK_M=bm, num_warps=max(tile["min_warps"], bc // tile["per_warp"]))
 
 
 def _table(ts):
@@ -243,13 +239,13 @@ def _table(ts):
 @torch.library.custom_op("attn_res::mix", mutates_args=(), device_types="cuda")
 def _mix_op(vs: list[Tensor], U: Tensor, ks: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """vs: (M, C) bf16 sources; U: (nb, C) float32. y = norm(h) of the mixture of vs under U[0], S = its (logsumexp,
-    rstd(h)) per token (float32; empty if ks = 0), and the state (acc bf16, mx, sm; nb - 1 rows) of the mixtures of
-    vs[:ks], the kept sources, under U[1:]."""
+    rstd(h)) per token (float32), and the state (acc bf16, mx, sm; nb - 1 rows) of the mixtures of vs[:ks], the kept
+    sources, under U[1:]."""
     (M, C), nb, f32 = vs[0].shape, U.shape[0], torch.float32
-    y, S = torch.empty_like(vs[0]), vs[0].new_empty(M * (ks > 0), 2, dtype=f32)
+    y, S = torch.empty_like(vs[0]), vs[0].new_empty(M, 2, dtype=f32)
     acc, mx, sm = vs[0].new_empty(nb - 1, M, C), vs[0].new_empty(nb - 1, M, dtype=f32), vs[0].new_empty(nb - 1, M, dtype=f32)
     grid, cfg = _grid(M, C, TILE)
-    _mix[grid](_table(vs), U, y, S, acc, mx, sm, M, len(vs), ks, nb, EPS, C=C, NBP=triton.next_power_of_2(nb), HAS_S=ks > 0, **cfg)
+    _mix[grid](_table(vs), U, y, S, acc, mx, sm, M, len(vs), ks, nb, EPS, C=C, NBP=triton.next_power_of_2(nb), **cfg)
     return y, S, acc, mx, sm
 
 
@@ -265,15 +261,15 @@ def _mix_from_op(vs: list[Tensor], u: Tensor, acc: Tensor, mx: Tensor, sm: Tenso
 
 @torch.library.custom_op("attn_res::bwd", mutates_args=(), device_types="cuda")
 def _bwd_op(dy: Tensor, y: Tensor, S: Tensor, ds: list[Tensor], U: Tensor, i: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """The backward of mixture i (see _bwd). S: empty if it read no kept source; ds: the source it alone read, or none.
-    Returns G, P (for its kept sources; empty without), dd (that source's gradient; empty without) and that source's
-    share of dU ((n, C) float32, row i)."""
+    """The backward of mixture i (see _bwd). ds: the source it alone read, if it read kept sources too; else none.
+    Returns G and P (G: also the gradient of a mixture's only source), dd (the gradient of the source of ds; empty
+    without) and that source's share of dU ((n, C) float32, row i)."""
     M, C = y.shape
-    has_g, has_d = S.numel() > 0, len(ds) > 0
-    G, P = y.new_empty(M * has_g, C), y.new_empty(M * has_g, 2, dtype=torch.float32)
-    dd, W, dU = y.new_empty(M * has_d, C), y.new_empty(int(has_d and has_g), M), torch.zeros_like(U)
+    has_d = len(ds) > 0
+    G, P = torch.empty_like(y), y.new_empty(M, 2, dtype=torch.float32)
+    dd, W, dU = y.new_empty(M * has_d, C), y.new_empty(int(has_d), M), torch.zeros_like(U)
     grid, cfg = _grid(M, C, TILE)
-    _bwd[grid](dy, y, S, (*ds, y)[0], U[i], G, P, dd, W, M, EPS, C=C, HAS_D=has_d, HAS_G=has_g, **cfg)
+    _bwd[grid](dy, y, S, (*ds, y)[0], U[i], G, P, dd, W, M, EPS, C=C, HAS_D=has_d, **cfg)
     dU[i:i + len(W)] = torch.mm(W, (*ds, y)[0], out_dtype=torch.float32)
     return G, P, dd, dU
 
@@ -313,11 +309,10 @@ def _f32(t, *shape):
     return t.new_empty(*shape, dtype=torch.float32)
 
 
-_mix_op.register_fake(lambda vs, U, ks: (torch.empty_like(vs[0]), _f32(vs[0], vs[0].shape[0] * (ks > 0), 2), vs[0].new_empty(U.shape[0] - 1, *vs[0].shape),
+_mix_op.register_fake(lambda vs, U, ks: (torch.empty_like(vs[0]), _f32(vs[0], vs[0].shape[0], 2), vs[0].new_empty(U.shape[0] - 1, *vs[0].shape),
                                          _f32(vs[0], U.shape[0] - 1, vs[0].shape[0]), _f32(vs[0], U.shape[0] - 1, vs[0].shape[0])))
 _mix_from_op.register_fake(lambda vs, u, acc, mx, sm: (torch.empty_like(acc), mx.new_empty(mx.shape[0], 2)))
-_bwd_op.register_fake(lambda dy, y, S, ds, U, i: (y.new_empty(S.shape[0], y.shape[1]), _f32(y, S.shape[0], 2), y.new_empty(y.shape[0] * len(ds), y.shape[1]),
-                                                  torch.empty_like(U)))
+_bwd_op.register_fake(lambda dy, y, S, ds, U, i: (torch.empty_like(y), _f32(y, y.shape[0], 2), y.new_empty(y.shape[0] * len(ds), y.shape[1]), torch.empty_like(U)))
 _bwd_src_op.register_fake(lambda v, Gs, Ps, U, first, part: (torch.empty_like(v), torch.empty_like(U)))
 _bwd_lead_op.register_fake(lambda vs, Gs, Ps, U, first: (vs[0].new_empty(len(vs), *vs[0].shape), torch.empty_like(U)))
 _total_op.register_fake(lambda dUs: torch.empty_like(dUs[0]))
@@ -363,9 +358,9 @@ class _Source(torch.autograd.Function):
     @staticmethod
     def forward(ctx, v, U, q, first, n, member):
         """A kept source v ((M, C) bf16), read by the mixtures first .. first + n - 1 (up to its group's boundary, or all the
-        rest). U: all the pseudo-queries (values); q: this node's token (see _Queries). Returns its n token pairs and, for a
-        group member, one more token that the group's lead node takes, whose gradient is v's share of dv from the mixtures
-        after the boundary."""
+        rest; none for the group's last member). U: all the pseudo-queries (values); q: this node's token (see _Queries).
+        Returns its n token pairs and, for a group member, one more token that the group's lead node takes, whose gradient
+        is v's share of dv from the mixtures from the boundary on."""
         ctx.save_for_backward(v, U)
         ctx.first, ctx.n, ctx.member = first, n, member
         ctx.set_materialize_grads(False)
@@ -419,9 +414,10 @@ class _Mix(torch.autograd.Function):
         gradients go through their tokens) and the last n_dir (0 or 1) the newest source if this mixture alone reads it
         (differentiated here); then this mixture's tokens, one pair per kept source or lead node. Returns y and the state, if any."""
         y, S, *state = _mix_ops(U, i, nb, acc, mx, sm, n_dir, list(args[:n_src]))
+        n_tok = (len(args) - n_src) // 2  # (none: no kept source, the mixture is the norm of its one source, whose gradient is G)
         ctx.mark_non_differentiable(*state)
-        ctx.save_for_backward(U, y, S, *args[n_src - n_dir:n_src])
-        ctx.i, ctx.n = i, (n_src, n_dir, (len(args) - n_src) // 2)
+        ctx.save_for_backward(U, y, S, *args[n_src - n_dir:n_src] * (n_tok > 0))
+        ctx.i, ctx.n = i, (n_src, n_dir, n_tok)
         return (y, *state)
 
     @staticmethod
@@ -429,7 +425,7 @@ class _Mix(torch.autograd.Function):
         U, y, S, *ds = ctx.saved_tensors
         n_src, n_dir, n_tok = ctx.n
         G, P, dd, dU = torch.ops.attn_res.bwd(dy.contiguous(), y, S, ds, U, ctx.i)
-        return (None, dU, *(None,) * 7, *(None,) * (n_src - n_dir), *(dd,) * n_dir, *(G,) * n_tok, *(P,) * n_tok)
+        return (None, dU, *(None,) * 7, *(None,) * (n_src - n_dir), *((G, dd)[n_tok > 0],) * n_dir, *(G,) * n_tok, *(P,) * n_tok)
 
 
 class _Stream:
@@ -441,6 +437,9 @@ class _Stream:
         self.q = iter(_Queries.apply(U, 2 * len(U) + len(U) // BLOCK + 2) if self.grad else ())  # a token per node, for its share of dU
         self.kept, self.direct = [], []  # the kept sources ((M, C) bf16, detached); the newest source, if the next mixture alone reads it
         self.tg, self.ts = [[] for _ in U], [[] for _ in U]  # per mixture: its tokens, a pair per kept source or lead node
+        reads = [0] * starts[0] + [i for i in range(len(U) - 1) if starts[i + 1]]  # the first reader of each source that will be kept
+        # BLOCK consecutive kept sources form a group, led from its last member's first reader on (its boundary) if BLOCK mixtures remain there
+        self.ends = [e if e + BLOCK <= len(U) else len(U) for e in reads[BLOCK - 1::BLOCK] for _ in range(BLOCK)] + [len(U)] * (len(reads) % BLOCK)
         self.group = {}  # a group's boundary (a mixture) -> its members: (source, token)
         self.first, self.seen, self.state = 0, 0, [U.new_empty(0)] * 3  # the last pass: its mixture, the kept sources it covered, the next mixtures' states
         self._new(x.reshape(-1, x.shape[-1]), starts[0])
@@ -456,7 +455,7 @@ class _Stream:
         """A kept source: its tokens for the mixtures up to its group's boundary (from there on the group's lead node stands in)."""
         self.kept.append(v.detach())
         if self.grad:
-            end = min((self.i // BLOCK + 1) * BLOCK, len(self.U))
+            end = self.ends[len(self.kept) - 1]
             member = end < len(self.U)
             toks = _Source.apply(v, self.U, next(self.q), self.i, end - self.i, member)
             self.group.setdefault(end, []).extend([(self.kept[-1], toks[-1])] * member)
