@@ -180,6 +180,7 @@ def _bwd_src(V, GT, PT, U, DV, W, PART, M, N, eps, C: tl.constexpr, HAS_P: tl.co
         acc = tl.load(PART + rm[:, None] * C + rc[None, :], mask=mask, other=0.0).to(tl.float32)
     else:
         acc = tl.zeros([BLOCK_M, BLOCK_C], tl.float32)
+    along = tl.zeros([BLOCK_M], tl.float32)  # the sum over readers of g r^3 (u . v) / C: v's own coefficient, applied once
     for m in range(N):
         dh = tl.load(tl.load(GT + m).to(tl.pointer_type(tl.bfloat16)) + rm[:, None] * C + rc[None, :], mask=mask, other=0.0).to(tl.float32)
         pp = tl.load(PT + m).to(tl.pointer_type(tl.float32))
@@ -188,9 +189,10 @@ def _bwd_src(V, GT, PT, U, DV, W, PART, M, N, eps, C: tl.constexpr, HAS_P: tl.co
         uv = tl.sum(v * u[None, :], 1)
         alpha = tl.exp(libdevice.mul_rn(uv, r) - lse)
         g = alpha * (tl.sum(dh * v, 1) - c)
-        acc += alpha[:, None] * dh + g[:, None] * (r[:, None] * u[None, :] - (r * r * r * uv / C)[:, None] * v)
+        acc += alpha[:, None] * dh + (g * r)[:, None] * u[None, :]
+        along += g * r * r * r * uv / C
         tl.store(W + m * M + rm, (g * r).to(tl.bfloat16), mask=mm)
-    tl.store(DV + rm[:, None] * C + rc[None, :], acc.to(tl.bfloat16), mask=mask)
+    tl.store(DV + rm[:, None] * C + rc[None, :], (acc - along[:, None] * v).to(tl.bfloat16), mask=mask)
 
 
 @triton.jit
@@ -206,6 +208,7 @@ def _bwd_lead(VT, GT, PT, U, PART, W, M, N, NB, eps, C: tl.constexpr, NBP: tl.co
     v = tl.load(vp[:, None, None] + (rm[None, :, None] * C + rc[None, None, :]), mask=mb[:, None, None] & mask[None, :, :], other=0.0).to(tl.float32)
     r = _rstd(v, eps, C)
     acc = tl.zeros([NBP, BLOCK_M, BLOCK_C], tl.float32)
+    along = tl.zeros([NBP, BLOCK_M], tl.float32)  # (as in _bwd_src)
     gn = tl.load(tl.load(GT).to(tl.pointer_type(tl.bfloat16)) + rm[:, None] * C + rc[None, :], mask=mask & (N > 0), other=0.0)
     for m in range(N):
         dh = gn.to(tl.float32)
@@ -217,9 +220,11 @@ def _bwd_lead(VT, GT, PT, U, PART, W, M, N, NB, eps, C: tl.constexpr, NBP: tl.co
         uv = tl.sum(v * u[None, None, :], 2)
         alpha = tl.exp(libdevice.mul_rn(uv, r) - lse[None, :])
         g = alpha * (tl.sum(dh[None, :, :] * v, 2) - c[None, :])
-        acc += alpha[:, :, None] * dh[None, :, :] + g[:, :, None] * (r[:, :, None] * u[None, None, :] - (r * r * r * uv / C)[:, :, None] * v)
+        acc += alpha[:, :, None] * dh[None, :, :] + (g * r)[:, :, None] * u[None, None, :]
+        along += g * r * r * r * uv / C
         tl.store(W + (rb[:, None].to(tl.int64) * N + m) * M + rm[None, :], (g * r).to(tl.bfloat16), mask=mb[:, None] & mm[None, :])
-    tl.store(PART + (rb[:, None, None].to(tl.int64) * M + rm[None, :, None]) * C + rc[None, None, :], acc.to(tl.bfloat16), mask=mb[:, None, None] & mask[None, :, :])
+    tl.store(PART + (rb[:, None, None].to(tl.int64) * M + rm[None, :, None]) * C + rc[None, None, :], (acc - along[:, :, None] * v).to(tl.bfloat16),
+             mask=mb[:, None, None] & mask[None, :, :])
 
 
 def _grid(M, C, tile):
