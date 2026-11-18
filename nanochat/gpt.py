@@ -21,7 +21,6 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
-from nanochat.attn_res import AttnResBackbone
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
@@ -191,7 +190,9 @@ class GPT(nn.Module):
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         if config.attn_res: # every sublayer is a block of the backbone, the embedding its input
-            h = AttnResBackbone(nn.ModuleList([m for i in range(config.n_layer) for m in (AttnResAttention(config, i, self.window_sizes[i]), AttnResMLP(config))]), config.n_embd)
+            from nanochat.attn_res import AttnResBackbone # (Triton kernels: imported only in this mode)
+            h = AttnResBackbone(nn.ModuleList([m for i in range(config.n_layer) for m in (AttnResAttention(config, i, self.window_sizes[i]), AttnResMLP(config))]),
+                                config.n_embd, starts=range(2 * config.n_layer), norm_input=True, norm_keys=True, norm_output=True)
         else:
             h = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)])
         self.transformer = nn.ModuleDict({
@@ -544,7 +545,7 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         if self.config.attn_res:
             ves = {int(i): ve(idx).to(x.dtype) for i, ve in self.value_embeds.items()}
-            x = self.transformer.h(norm(x), ves, cos_sin, kv_cache) # (the output is normed)
+            x = self.transformer.h(x, ves, cos_sin, kv_cache) # (every sublayer reads a normed mixture; the output is normed)
         else:
             x0 = x  # save initial normalized embedding for x0 residual
             n_layer = self.config.n_layer
