@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
+from nanochat.attn_res import AttnResBackbone
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
@@ -37,6 +38,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Attention Residuals (nanochat/attn_res.py): every attention and MLP reads a softmax-over-depth mixture of the
+    # embedding and all earlier sublayer outputs instead of a residual stream (no resid/x0 lambdas, no backout)
+    attn_res: bool = False
 
 
 def norm(x):
@@ -153,6 +157,22 @@ class Block(nn.Module):
         return x
 
 
+class AttnResAttention(CausalSelfAttention):
+    """A layer's attention as an AttnRes block: reads the mixture (already normed), returns its output."""
+    def __init__(self, config, layer_idx, window_size):
+        super().__init__(config, layer_idx)
+        self.window_size = window_size
+
+    def forward(self, x, ves, cos_sin, kv_cache):
+        return super().forward(x, ves.get(self.layer_idx), cos_sin, self.window_size, kv_cache)
+
+
+class AttnResMLP(MLP):
+    """A layer's MLP as an AttnRes block."""
+    def forward(self, x, ves, cos_sin, kv_cache):
+        return super().forward(x)
+
+
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -170,22 +190,27 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        if config.attn_res: # every sublayer is a block of the backbone, the embedding its input
+            h = AttnResBackbone(nn.ModuleList([m for i in range(config.n_layer) for m in (AttnResAttention(config, i, self.window_sizes[i]), AttnResMLP(config))]), config.n_embd)
+        else:
+            h = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)])
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": h,
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
-        # Per-layer learnable scalars (inspired by modded-nanogpt)
-        # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
-        # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
-        # Separate parameters so they can have different optimizer treatment
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+        if not config.attn_res:
+            # Per-layer learnable scalars (inspired by modded-nanogpt)
+            # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
+            # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
+            # Separate parameters so they can have different optimizer treatment
+            self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
+            self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+            # Backout: subtract cached mid-layer residual before final norm to remove low-level features
+            self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
         # Smear: mix previous token's embedding into current token (cheap bigram-like info)
         self.smear_gate = Linear(24, 1, bias=False)
         self.smear_lambda = nn.Parameter(torch.zeros(1))
-        # Backout: subtract cached mid-layer residual before final norm to remove low-level features
-        self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -223,26 +248,29 @@ class GPT(nn.Module):
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        for attn, mlp in self.layers():
+            torch.nn.init.uniform_(attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+            torch.nn.init.uniform_(attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(attn.c_proj.weight) # projections are zero
+            torch.nn.init.uniform_(mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+            torch.nn.init.zeros_(mlp.c_proj.weight)
 
         # Per-layer scalars
-        # Per-layer resid init: stronger residual at early layers, weaker at deep layers
         n_layer = self.config.n_layer
-        for i in range(n_layer):
-            self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
-        # Decaying x0 init: earlier layers get more input embedding blending
-        for i in range(n_layer):
-            self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+        if self.config.attn_res:
+            torch.nn.init.zeros_(self.transformer.h.pseudo_queries) # uniform mixtures at the start
+        else:
+            # Per-layer resid init: stronger residual at early layers, weaker at deep layers
+            for i in range(n_layer):
+                self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
+            # Decaying x0 init: earlier layers get more input embedding blending
+            for i in range(n_layer):
+                self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+            torch.nn.init.constant_(self.backout_lambda, 0.2)
 
-        # Smear/backout scalars and smear gate must be explicitly initialized 
+        # Smear scalar and gate must be explicitly initialized
         torch.nn.init.zeros_(self.smear_lambda)
-        torch.nn.init.constant_(self.backout_lambda, 0.2)
         torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
         # Value embeddings (init like c_v: uniform with same std)
@@ -250,9 +278,9 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Gate weights init with small positive values so gates start slightly above neutral
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+        for attn, _ in self.layers():
+            if attn.ve_gate is not None:
+                torch.nn.init.uniform_(attn.ve_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -266,6 +294,13 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
+
+    def layers(self):
+        """(attention, MLP) of every layer."""
+        if self.config.attn_res:
+            b = self.transformer.h.blocks
+            return [(b[2 * i], b[2 * i + 1]) for i in range(self.config.n_layer)]
+        return [(block.attn, block.mlp) for block in self.transformer.h]
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -403,8 +438,8 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
+        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters()) - (self.transformer.h.pseudo_queries.numel() if self.config.attn_res else 0)
+        scalars = sum(p.numel() for p in self.scalar_params())
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -416,18 +451,26 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def scalar_params(self):
+        """The small parameters outside the matrices and embeddings."""
+        if self.config.attn_res:
+            return [self.transformer.h.pseudo_queries, self.smear_gate.weight, self.smear_lambda]
+        return [self.resid_lambdas, self.x0_lambdas, self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
+
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, attn_res_lr=1e-3):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        attn_res = self.config.attn_res
+        matrix_params = [p for p in self.transformer.h.parameters() if not attn_res or p is not self.transformer.h.pseudo_queries]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        resid_params = [] if attn_res else [self.resid_lambdas]
+        x0_params = [] if attn_res else [self.x0_lambdas]
+        smear_params = [self.smear_gate.weight, self.smear_lambda] + ([] if attn_res else [self.backout_lambda])
+        attn_res_params = [self.transformer.h.pseudo_queries] if attn_res else []
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(attn_res_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -439,10 +482,15 @@ class GPT(nn.Module):
             dict(kind='adamw', name='lm_head', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', name='embedding', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', name='value_embeds', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', name='resid', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', name='x0', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', name='smear', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if attn_res: # pseudo-queries: Adam at attn_res_lr as given (no dmodel scaling), no weight decay
+            param_groups.append(dict(kind='adamw', name='attn_res', params=attn_res_params, lr=attn_res_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+        else:
+            param_groups += [
+                dict(kind='adamw', name='resid', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
+                dict(kind='adamw', name='x0', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+            ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -494,20 +542,24 @@ class GPT(nn.Module):
                 x = x + gate * x_pre_smear
 
         # Forward the trunk of the Transformer
-        x0 = x  # save initial normalized embedding for x0 residual
-        n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
-        x_backout = None
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-            if i == backout_layer:
-                x_backout = x
-        # Subtract mid-layer residual to remove low-level features before logit projection
-        if x_backout is not None:
-            x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+        if self.config.attn_res:
+            ves = {int(i): ve(idx).to(x.dtype) for i, ve in self.value_embeds.items()}
+            x = self.transformer.h(norm(x), ves, cos_sin, kv_cache) # (the output is normed)
+        else:
+            x0 = x  # save initial normalized embedding for x0 residual
+            n_layer = self.config.n_layer
+            backout_layer = n_layer // 2  # cache at halfway point
+            x_backout = None
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+                if i == backout_layer:
+                    x_backout = x
+            # Subtract mid-layer residual to remove low-level features before logit projection
+            if x_backout is not None:
+                x = x - self.backout_lambda.to(x.dtype) * x_backout
+            x = norm(x)
         if logit_positions is not None:
             x = x[:, logit_positions]
             targets = None if targets is None else targets[:, logit_positions]
