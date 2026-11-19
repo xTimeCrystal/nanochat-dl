@@ -41,12 +41,14 @@ class GPTConfig:
     # Attention Residuals (nanochat/attn_res.py): every attention and MLP reads a softmax-over-depth mixture of the
     # embedding and all earlier sublayer outputs instead of a residual stream (no resid/x0 lambdas, no backout)
     attn_res: bool = False
-    # Mixture of Experts in place of the MLP (nanochat/moe.py), named as in Kimi K3's config. 0 experts = the dense MLP.
-    # No defaults: with experts, set every field. Shared experts are num_shared_experts * moe_intermediate_size wide.
+    # Mixture of Experts in place of the MLP (nanochat/moe.py): routed experts, of which a token goes through
+    # num_experts_per_token, plus shared experts that every token goes through. 0 routed experts = the dense MLP.
+    # No defaults: with experts, set every field. The two sizes are the hidden widths of one routed and of one shared expert.
     num_experts: int = 0
     num_experts_per_token: int | None = None
     moe_intermediate_size: int | None = None
     num_shared_experts: int | None = None
+    shared_intermediate_size: int | None = None
 
 
 def norm(x):
@@ -154,9 +156,10 @@ class MLP(nn.Module):
 def moe_of(config):
     """A layer's MoE (nanochat/moe.py) from the config: every field given, no defaults, no derived widths."""
     from nanochat.moe import MoE # (Triton kernels: imported only with experts)
-    for name in ("num_experts_per_token", "moe_intermediate_size", "num_shared_experts"):
+    for name in ("num_experts_per_token", "moe_intermediate_size", "num_shared_experts", "shared_intermediate_size"):
         assert getattr(config, name) is not None, f"MoE: set {name} explicitly (no defaults, no derived widths)"
-    return MoE(config.n_embd, config.num_experts, config.num_experts_per_token, config.moe_intermediate_size, config.num_shared_experts)
+    return MoE(config.n_embd, config.num_experts, config.num_experts_per_token, config.moe_intermediate_size,
+               config.num_shared_experts, config.shared_intermediate_size, activation="relu2") # (the dense MLP's)
 
 
 class Block(nn.Module):
@@ -411,7 +414,7 @@ class GPT(nn.Module):
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
         """
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
-        matmul_params += sum(m.router.numel() for m in self.moes()) + self.num_active_expert_params() # MoE: what a token goes through
+        matmul_params += sum(m.routed.router.numel() for m in self.moes()) + self.num_active_expert_params() # MoE: what a token goes through
         return matmul_params
 
     def moes(self):
@@ -428,11 +431,11 @@ class GPT(nn.Module):
         # every expert's load since the last call relative to an even split, (layers, experts), summed over micro-batches
         # and ranks (an all-reduce: every rank calls it), then reset
         moes = self.moes()
-        load = torch.stack([m.load for m in moes])
+        load = torch.stack([m.routed.load for m in moes])
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(load)
         for m in moes:
-            m.load.zero_()
+            m.routed.load.zero_()
         return load / load.mean(1, keepdim=True).clamp_min(1)
 
     def estimate_decode_flops(self, context_len):

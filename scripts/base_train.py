@@ -54,8 +54,9 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--num-experts", type=int, default=0, help="MoE in place of the MLP: routed experts per layer (0 = dense MLP)")
 parser.add_argument("--num-experts-per-token", type=int, default=None, help="MoE: routed experts per token (required with experts)")
-parser.add_argument("--moe-intermediate-size", type=int, default=None, help="MoE: hidden width of one expert (required with experts)")
-parser.add_argument("--num-shared-experts", type=int, default=None, help="MoE: shared experts, each moe-intermediate-size wide (required with experts; 0 = none)")
+parser.add_argument("--moe-intermediate-size", type=int, default=None, help="MoE: hidden width of one routed expert (required with experts)")
+parser.add_argument("--num-shared-experts", type=int, default=None, help="MoE: shared experts, which every token goes through (required with experts)")
+parser.add_argument("--shared-intermediate-size", type=int, default=None, help="MoE: hidden width of one shared expert (required with experts)")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--attn-res", action="store_true", help="Attention Residuals: every sublayer reads a softmax-over-depth mixture of all earlier outputs instead of a residual stream")
 # Training horizon (only one used, in order of precedence)
@@ -153,7 +154,7 @@ def build_model_meta(depth, dense=False):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern, attn_res=args.attn_res,
         num_experts=0 if dense else args.num_experts, num_experts_per_token=args.num_experts_per_token,
-        moe_intermediate_size=args.moe_intermediate_size, num_shared_experts=args.num_shared_experts,
+        moe_intermediate_size=args.moe_intermediate_size, num_shared_experts=args.num_shared_experts, shared_intermediate_size=args.shared_intermediate_size,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

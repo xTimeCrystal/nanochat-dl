@@ -1,5 +1,5 @@
-"""Mixture of Experts in the style of Kimi K3 (github.com/MoonshotAI/Kimi-K3) as an MLP sublayer: MoE.
-The routed experts run on Triton kernels: with any, the activations must be bfloat16 on CUDA."""
+"""Mixture of Experts in the style of Kimi K3 (github.com/MoonshotAI/Kimi-K3) as an MLP sublayer: SharedExperts (a
+standard MLP), RoutedExperts (Triton kernels: bfloat16 on CUDA) and MoE, their sum."""
 
 import torch
 import torch.nn as nn
@@ -19,11 +19,14 @@ NONE, ACT, DZ = (tl.constexpr(i) for i in range(3))  # epilogues of _rows
 
 
 @triton.jit
-def _rows(A, W, OUT, P, HID, ROWSLOT, TILES, KD, ND, NP,
-          K: tl.constexpr, GATHER: tl.constexpr, SCATTER: tl.constexpr, WT: tl.constexpr, EPI: tl.constexpr,
+def _rows(A, W, OUT, P, HID, DOTS, ROWSLOT, TILES, KD, ND, NP,
+          K: tl.constexpr, GATHER: tl.constexpr, SCATTER: tl.constexpr, WT: tl.constexpr, EPI: tl.constexpr, SILU: tl.constexpr,
           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     # OUT[rows] = epilogue(A[rows] @ W[e]) for one row tile of expert e. slot = ROWSLOT[row] = token * K + k; GATHER reads A
-    # by token, SCATTER writes OUT by slot, WT uses W[e] transposed. ACT: a = p * relu(.)^2 (forward), DZ: g * 2 sqrt(p a)
+    # by token, SCATTER writes OUT by slot, WT uses W[e] transposed. The epilogues, with a = p act(z):
+    #   ACT (forward, the product is z): a; with SILU also z into HID, which silu's derivative needs
+    #   DZ (backward, the product is da): da * da/dz. relu^2: 2 sqrt(p a) from HID = a. SILU: from HID = z, and this program's
+    #   share of <da, silu(z)> = dL/dp into DOTS[slot]
     t, pn = tl.program_id(0) // NP, tl.program_id(0) % NP  # a tile's NP programs run together: its rows of A stay cached
     cnt = tl.load(TILES + 3 * t + 2)
     if cnt > 0:
@@ -49,13 +52,22 @@ def _rows(A, W, OUT, P, HID, ROWSLOT, TILES, KD, ND, NP,
             acc = tl.dot(a, b.to(a.dtype), acc)
         mask = mm[:, None] & mn[None, :]
         if EPI != NONE:
-            pv = tl.load(P + slot, mask=mm, other=1.0).to(tl.float32)
+            pv = tl.load(P + slot, mask=mm, other=1.0).to(tl.float32)[:, None]
         if EPI == ACT:
-            acc = tl.maximum(acc, 0.0)
-            acc = acc * acc * pv[:, None]
+            if SILU:
+                tl.store(HID + rows[:, None] * ND + rn[None, :], acc.to(HID.dtype.element_ty), mask=mask)
+                acc = acc * tl.sigmoid(acc) * pv
+            else:
+                acc = tl.maximum(acc, 0.0)
+                acc = acc * acc * pv
         if EPI == DZ:
             hid = tl.load(HID + rows[:, None] * ND + rn[None, :], mask=mask, other=0.0).to(tl.float32)
-            acc = acc * 2.0 * tl.sqrt(hid * pv[:, None])
+            if SILU:
+                s = tl.sigmoid(hid)
+                tl.store(DOTS + slot * NP + pn, tl.sum(acc * hid * s, 1), mask=mm)
+                acc = acc * pv * s * (1.0 + hid * (1.0 - s))
+            else:
+                acc = acc * 2.0 * tl.sqrt(hid * pv)
         tl.store(OUT + orow[:, None] * ND + rn[None, :], acc.to(OUT.dtype.element_ty), mask=mask)
 
 
@@ -134,14 +146,15 @@ def _block(n, cfg, key):
     return b, triton.cdiv(n, b)
 
 
-def _rows_gemm(a, w, out, p, plan, epi=NONE, gather=False, scatter=False, wt=False, hid=None):
+def _rows_gemm(a, w, out, p, plan, epi=NONE, gather=False, scatter=False, wt=False, silu=False, hid=None, dots=None):
     rowslot, off, tiles = plan
-    hid = out if hid is None else hid
+    hid = out if hid is None else hid  # (what an epilogue does not touch: any pointer)
+    dots = out if dots is None else dots
     kd, nd = a.shape[1], out.shape[1]
     bn, n = _block(nd, ROWS, "BN")
     cfg = dict(ROWS, BN=bn, BK=min(ROWS["BK"], triton.next_power_of_2(kd)))
-    _rows[(len(tiles) * n,)](a, w, out, p, hid, rowslot, tiles, kd, nd, n, K=p.shape[1],
-                           GATHER=gather, SCATTER=scatter, WT=wt, EPI=epi, **cfg)
+    _rows[(len(tiles) * n,)](a, w, out, p, hid, dots, rowslot, tiles, kd, nd, n, K=p.shape[1],
+                           GATHER=gather, SCATTER=scatter, WT=wt, EPI=epi, SILU=silu, **cfg)
 
 
 def _weight_grad(l, r, out, plan, lgather):
@@ -190,32 +203,33 @@ register_optimizer_step_post_hook(lambda *_: _COPIES.clear())
 
 
 # forward and backward as custom ops, so torch.compile compiles the model around them; the forward also returns what the
-# backward reuses (gated activations a, plan).
+# backward reuses (gated activations a, for silu the pre-activations z, the plan).
 @torch.library.custom_op("moe::routed_experts", mutates_args=())
-def _experts(x: Tensor, wu: Tensor, wd: Tensor, sel: Tensor, p: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    (T, K), E, D = sel.shape, wu.shape[0], x.shape[1]
+def _experts(x: Tensor, wu: Tensor, wd: Tensor, sel: Tensor, p: Tensor, silu: bool) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    (T, K), (E, H, D) = sel.shape, wu.shape
     x, p = x.contiguous(), p.contiguous()
     wub, wdb = _kernel_weights(wu, wd, x.dtype)
     plan = make_plan(sel, E)
-    a = x.new_empty(T * K, wu.shape[1])
-    _rows_gemm(x, wub, a, p, plan, ACT, gather=True, wt=True)  # a = p * relu(x @ wu^T)^2
+    a, z = x.new_empty(T * K, H), x.new_empty(T * K if silu else 0, H)
+    _rows_gemm(x, wub, a, p, plan, ACT, gather=True, wt=True, silu=silu, hid=z if silu else None)  # z = x @ wu^T, a = p * act(z)
     o = x.new_empty(T * K, D)
     _rows_gemm(a, wdb, o, p, plan, scatter=True, wt=True)  # o = a @ wd^T
-    return _sum_slots(o, T, K), a, *plan
+    return _sum_slots(o, T, K), a, z, *plan
 
 
 _SIDE = {}  # device -> its second stream
 
 
 @torch.library.custom_op("moe::routed_experts_backward", mutates_args=())
-def _experts_backward(dy: Tensor, x: Tensor, p: Tensor, a: Tensor, wu: Tensor, wd: Tensor,
-                      rowslot: Tensor, off: Tensor, tiles: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+def _experts_backward(dy: Tensor, x: Tensor, p: Tensor, a: Tensor, z: Tensor, wu: Tensor, wd: Tensor,
+                      rowslot: Tensor, off: Tensor, tiles: Tensor, silu: bool) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     (T, K), D = p.shape, x.shape[1]
     x, p, dy = x.contiguous(), p.contiguous(), dy.contiguous().to(x.dtype)
     wub, wdb = _kernel_weights(wu, wd, x.dtype)
     plan = rowslot, off, tiles
     dz, dxs = torch.empty_like(a), x.new_empty(T * K, D)
     dwu, dwd = wu.new_empty(wu.shape), wd.new_empty(wd.shape)
+    dots = p.new_empty(T * K, _block(a.shape[1], ROWS, "BN")[1]) if silu else None  # per slot, each column program's share of dL/dp
     # Two pairs that do not depend on each other, one per stream: with few rows a launch's last wave of tiles is part
     # empty, and the other stream's kernel fills it. Side stream: dwd, then dwu once dz is there.
     main = torch.cuda.current_stream()
@@ -223,52 +237,64 @@ def _experts_backward(dy: Tensor, x: Tensor, p: Tensor, a: Tensor, wu: Tensor, w
     side.wait_stream(main)
     with torch.cuda.stream(side):
         _weight_grad(dy, a, dwd, plan, lgather=True)  # dy^T a
-    _rows_gemm(dy, wdb, dz, p, plan, DZ, gather=True, hid=a)  # dz = (dy @ wd) * da/dz
+    _rows_gemm(dy, wdb, dz, p, plan, DZ, gather=True, silu=silu, hid=z if silu else a, dots=dots)  # da = dy @ wd, dz = da * da/dz
     side.wait_stream(main)
     with torch.cuda.stream(side):
         _weight_grad(dz, x, dwu, plan, lgather=False)  # dz^T x
     _rows_gemm(dz, wub, dxs, p, plan, scatter=True)  # dx per slot = dz @ wu
     main.wait_stream(side)  # (before the caller's stream can free or reuse what the side stream reads)
-    # a is of degree 2 in z, so dL/dp = <da, a> / p = <dz @ wu, x> / (2 p): the slot's dx dotted with x
+    if silu:  # dL/dp = <da, silu(z)>: the dots of dz's epilogue
+        return _sum_slots(dxs, T, K), dwu, dwd, dots.sum(1).view(T, K)
+    # relu^2: a is of degree 2 in z, so dL/dp = <da, a> / p = <dz @ wu, x> / (2 p): the slot's dx dotted with x, in the slot sum
     dx, dots = _sum_slots(dxs, T, K, x)
     return dx, dwu, dwd, dots / (2 * p)
 
 
 @_experts.register_fake
-def _(x, wu, wd, sel, p):
+def _(x, wu, wd, sel, p, silu):
     R, (E, H, D) = sel.numel(), wu.shape
-    return x.new_empty(x.shape), x.new_empty(R, H), sel.new_empty(R), sel.new_empty(E + 1), sel.new_empty(triton.cdiv(R, ROWS["BM"]) + E, 3)
+    return (x.new_empty(x.shape), x.new_empty(R, H), x.new_empty(R if silu else 0, H),
+            sel.new_empty(R), sel.new_empty(E + 1), sel.new_empty(triton.cdiv(R, ROWS["BM"]) + E, 3))
 
 
 @_experts_backward.register_fake
-def _(dy, x, p, a, wu, wd, rowslot, off, tiles):
+def _(dy, x, p, a, z, wu, wd, rowslot, off, tiles, silu):
     return x.new_empty(x.shape), wu.new_empty(wu.shape), wd.new_empty(wd.shape), p.new_empty(p.shape)
 
 
 def _setup(ctx, inputs, output):
-    x, wu, wd, sel, p = inputs
-    ctx.save_for_backward(x, p, output[1], wu, wd, *output[2:])
+    x, wu, wd, sel, p, silu = inputs
+    ctx.save_for_backward(x, p, *output[1:3], wu, wd, *output[3:])
+    ctx.silu = silu
 
 
 def _backward(ctx, dy, *unused):
-    dx, dwu, dwd, dp = _experts_backward(dy, *ctx.saved_tensors)
-    return dx, dwu, dwd, None, dp
+    dx, dwu, dwd, dp = _experts_backward(dy, *ctx.saved_tensors, ctx.silu)
+    return dx, dwu, dwd, None, dp, None
 
 
 _experts.register_autograd(_backward, setup_context=_setup)
 
 
-def routed_experts(x, wu, wd, sel, p):
-    # y = sum_k p[:, k] * expert_{sel[:, k]}(x); x (T, D) bf16, wu (E, H, D), wd (E, D, H), sel (T, K), p (T, K) float32.
-    # Any D and H, but the kernels load a row as vectors only if its length is a multiple of 16: at other widths the GEMMs
-    # run at half speed.
-    return _experts(x, wu, wd, sel, p)[0]
+def relu2(h):
+    return F.relu(h).square()
+
+
+ACTIVATIONS = {"relu2": relu2, "silu": F.silu}  # of an expert's hidden units: relu squared (nanochat's MLP) or silu
+
+
+def routed_experts(x, wu, wd, sel, p, activation):
+    # y = sum_k p[:, k] * expert_{sel[:, k]}(x), expert_e(x) = act(x @ wu[e]^T) @ wd[e]^T, act one of ACTIVATIONS;
+    # x (T, D) bf16, wu (E, H, D), wd (E, D, H), sel (T, K), p (T, K) float32. Any D and H, but the kernels load a row as
+    # vectors only if its length is a multiple of 16: at other widths the GEMMs run at half speed.
+    assert activation in ACTIVATIONS, f"activation must be one of {list(ACTIVATIONS)}, not {activation!r}"
+    return _experts(x, wu, wd, sel, p, activation == "silu")[0]
 
 
 # Quantile Balancing (Kimi K3 tech report, 2.3.3): after each batch, per expert, the bias that would have given it exactly
 # k/E of the tokens with every token's cutoff held fixed, read off a histogram of the routing margins (score + bias - the
 # token's cutoff). Histograms add, so DDP all-reduces them. A token's cutoff may lie anywhere between its k-th and (k+1)-th
-# largest biased scores; the report takes the (k+1)-th, MoE.routed their midpoint (see there).
+# largest biased scores; the report takes the (k+1)-th, RoutedExperts.forward their midpoint (see there).
 BINS, SPAN = 512, 0.5
 
 
@@ -298,73 +324,89 @@ def _(counts, bias, k):
     return torch.empty_like(bias)
 
 
-class MoE(nn.Module):
-    """An MLP sublayer, model_dim -> model_dim: y = shared(x) + sum over the token's k experts of p_k expert_k(x).
+class SharedExperts(nn.Module):
+    """Experts that every token goes through: y = sum over the experts of act(x @ up^T) @ down^T. Any device and dtype.
+    One expert 4 * model_dim wide is the standard MLP.
+
+    model_dim                  width of x and y
+    num_shared_experts         experts
+    shared_intermediate_size   hidden width of one expert
+    activation                 "relu2" (relu squared, nanochat's) or "silu"
+    """
+
+    def __init__(self, model_dim: int, num_shared_experts: int, shared_intermediate_size: int, activation: str):
+        super().__init__()
+        assert num_shared_experts > 0 and shared_intermediate_size > 0, "SharedExperts: num_shared_experts > 0 and shared_intermediate_size > 0"
+        assert activation in ACTIVATIONS, f"activation must be one of {list(ACTIVATIONS)}, not {activation!r}"
+        self.model_dim, self.act = model_dim, ACTIVATIONS[activation]
+        # the experts' hidden units side by side: one MLP num_shared_experts * shared_intermediate_size wide
+        self.up = nn.Parameter(torch.empty(num_shared_experts * shared_intermediate_size, model_dim))
+        self.down = nn.Parameter(torch.empty(model_dim, num_shared_experts * shared_intermediate_size))
+
+    def init_weights(self):
+        """nanochat's MLP init: up uniform with std 0.4 / sqrt(model_dim), down zero."""
+        s = 3 ** 0.5 * self.model_dim ** -0.5  # (uniform on (-s, s) has std 1 / sqrt(model_dim))
+        torch.nn.init.uniform_(self.up, -0.4 * s, 0.4 * s)
+        torch.nn.init.zeros_(self.down)
+
+    def num_active_params(self):
+        """The parameters a token goes through: all of them."""
+        return self.up.numel() + self.down.numel()
+
+    def forward(self, x):
+        return F.linear(self.act(F.linear(x, self.up.to(x.dtype))), self.down.to(x.dtype))
+
+
+class RoutedExperts(nn.Module):
+    """Experts of which a token goes through its own k: y = sum over them of p * act(x @ up^T) @ down^T.
 
     s = sigmoid(x @ router^T)                    router scores, one per expert
     the token's experts: top-k of s + bias       the bias only steers the selection; Quantile Balancing sets it in training
     p = s[experts] / sum(s[experts])             mixture weights
-    expert(x) = relu(x @ up^T)^2 @ down^T        relu^2 as in the dense MLP; the shared experts together are one such MLP
 
     model_dim                width of x and y
-    num_experts              routed experts. 0: the shared experts alone, a standard MLP: no router, no kernel, any device.
-    num_experts_per_token    k, the routed experts of a token (0 without routed experts)
-    moe_intermediate_size    hidden width of one expert, routed or shared
-    num_shared_experts       shared experts, on every token (0: none)
+    num_experts              experts
+    num_experts_per_token    k, the experts of a token
+    moe_intermediate_size    hidden width of one expert
+    activation               "relu2" (relu squared, nanochat's) or "silu"
 
-    With routed experts the input is bfloat16 on CUDA (Triton kernels), model_dim and moe_intermediate_size are multiples
-    of 16, and every routed (token, expert) pair is computed: nothing is dropped. In training, each forward also sets the
-    bias for the next batch from this one's routing, and the kernels read their own bfloat16 copies of the expert weights,
-    made again when the weights change: after an optimizer step or an in-place write, not after a write through .data.
+    Triton kernels: the input is bfloat16 on CUDA, model_dim and moe_intermediate_size are multiples of 16, and every
+    (token, expert) pair is computed: nothing is dropped. In training, each forward also sets the bias for the next batch
+    from this one's routing, and the kernels read their own bfloat16 copies of the weights, made again when the weights
+    change: after an optimizer step or an in-place write, not after a write through .data.
     """
 
-    def __init__(self, model_dim: int, num_experts: int, num_experts_per_token: int, moe_intermediate_size: int, num_shared_experts: int):
+    def __init__(self, model_dim: int, num_experts: int, num_experts_per_token: int, moe_intermediate_size: int, activation: str):
         super().__init__()
-        assert (num_experts_per_token > 0) == (num_experts > 0) and num_experts_per_token < max(num_experts, 1), "MoE: 0 < num_experts_per_token < num_experts, or both 0"
-        assert num_experts + num_shared_experts > 0, "MoE: no experts at all"
-        assert num_experts == 0 or (model_dim % 16 == 0 and moe_intermediate_size % 16 == 0), \
-            "MoE: with routed experts, model_dim and moe_intermediate_size must be multiples of 16 (at other widths the kernels' GEMMs run at half speed)"
-        E, K, D, H, S = num_experts, num_experts_per_token, model_dim, moe_intermediate_size, num_shared_experts
-        self.model_dim, self.num_experts, self.num_experts_per_token, self.num_shared_experts = D, E, K, S
-        if E > 0:
-            self.router = nn.Parameter(torch.empty(E, D))
-            self.wu = nn.Parameter(torch.empty(E, H, D))
-            self.wd = nn.Parameter(torch.empty(E, D, H))
-            self.register_buffer("bias", torch.zeros(E))  # selection bias, set by Quantile Balancing
-            self.register_buffer("load", torch.zeros(E), persistent=False)  # selections per expert since they were last read and zeroed
-        if S > 0:
-            self.shared_up = nn.Parameter(torch.empty(S * H, D))
-            self.shared_down = nn.Parameter(torch.empty(D, S * H))
+        assert 0 < num_experts_per_token < num_experts, "RoutedExperts: 0 < num_experts_per_token < num_experts"
+        assert moe_intermediate_size > 0 and model_dim % 16 == 0 and moe_intermediate_size % 16 == 0, \
+            "RoutedExperts: model_dim and moe_intermediate_size must be multiples of 16 (at other widths the kernels' GEMMs run at half speed)"
+        assert activation in ACTIVATIONS, f"activation must be one of {list(ACTIVATIONS)}, not {activation!r}"
+        self.model_dim, self.num_experts, self.num_experts_per_token, self.activation = model_dim, num_experts, num_experts_per_token, activation
+        self.router = nn.Parameter(torch.empty(num_experts, model_dim))
+        self.up = nn.Parameter(torch.empty(num_experts, moe_intermediate_size, model_dim))
+        self.down = nn.Parameter(torch.empty(num_experts, model_dim, moe_intermediate_size))
+        self.register_buffer("bias", torch.zeros(num_experts))  # selection bias, set by Quantile Balancing
+        self.register_buffer("load", torch.zeros(num_experts), persistent=False)  # selections per expert since they were last read and zeroed
 
     def init_weights(self):
-        """nanochat's MLP init: up-projections uniform with std 0.4 / sqrt(model_dim), down-projections zero; the router
-        uniform with std 1 / sqrt(model_dim); the balancing bias and the load counts zero."""
+        """The experts as nanochat's MLP (up uniform with std 0.4 / sqrt(model_dim), down zero); the router uniform with
+        std 1 / sqrt(model_dim); the balancing bias and the load counts zero."""
         s = 3 ** 0.5 * self.model_dim ** -0.5  # (uniform on (-s, s) has std 1 / sqrt(model_dim))
-        if self.num_experts > 0:
-            torch.nn.init.uniform_(self.router, -s, s)
-            torch.nn.init.uniform_(self.wu, -0.4 * s, 0.4 * s)
-            torch.nn.init.zeros_(self.wd)
-            self.bias.zero_()
-            self.load.zero_()
-        if self.num_shared_experts > 0:
-            torch.nn.init.uniform_(self.shared_up, -0.4 * s, 0.4 * s)
-            torch.nn.init.zeros_(self.shared_down)
+        torch.nn.init.uniform_(self.router, -s, s)
+        torch.nn.init.uniform_(self.up, -0.4 * s, 0.4 * s)
+        torch.nn.init.zeros_(self.down)
+        self.bias.zero_()
+        self.load.zero_()
 
     def num_active_params(self):
-        """The parameters a token goes through: the shared experts and k of the routed ones (the router aside)."""
-        n = 0
-        if self.num_experts > 0:
-            n += (self.wu.numel() + self.wd.numel()) * self.num_experts_per_token // self.num_experts
-        if self.num_shared_experts > 0:
-            n += self.shared_up.numel() + self.shared_down.numel()
-        return n
+        """The parameters a token goes through: k of the experts (the router aside)."""
+        return (self.up.numel() + self.down.numel()) * self.num_experts_per_token // self.num_experts
 
-    def shared(self, x):
-        return F.linear(F.relu(F.linear(x, self.shared_up.to(x.dtype))).square(), self.shared_down.to(x.dtype))
-
-    def routed(self, x):
-        assert x.is_cuda and x.dtype == torch.bfloat16, "MoE runs its routed experts on Triton kernels: its input must be bfloat16 on CUDA"
-        k = self.num_experts_per_token
+    def forward(self, x):
+        assert x.is_cuda and x.dtype == torch.bfloat16, "RoutedExperts runs on Triton kernels: its input must be bfloat16 on CUDA"
+        shape, k = x.shape, self.num_experts_per_token
+        x = x.reshape(-1, shape[-1])
         s = torch.sigmoid(F.linear(x, self.router.to(x.dtype)).float())
         top = (s + self.bias).topk(k + 1, dim=1)
         sel = top.indices[:, :k]
@@ -378,16 +420,27 @@ class MoE(nn.Module):
         g = s.gather(1, sel)
         # In training the op takes the weights as they are and keeps its own copies in x's dtype from one optimizer step to
         # the next (_kernel_weights). In eval they are cast here on every call, as a Linear's are.
-        wu, wd = (self.wu, self.wd) if self.training else (self.wu.to(x.dtype), self.wd.to(x.dtype))
-        return routed_experts(x, wu, wd, sel, g / g.sum(1, keepdim=True))
+        up, down = (self.up, self.down) if self.training else (self.up.to(x.dtype), self.down.to(x.dtype))
+        return routed_experts(x, up, down, sel, g / g.sum(1, keepdim=True), self.activation).view(shape)
+
+
+class MoE(nn.Module):
+    """An MLP sublayer of shared and routed experts: y = shared(x) + routed(x). The arguments are SharedExperts' and
+    RoutedExperts', with one activation for both."""
+
+    def __init__(self, model_dim: int, num_experts: int, num_experts_per_token: int, moe_intermediate_size: int,
+                 num_shared_experts: int, shared_intermediate_size: int, activation: str):
+        super().__init__()
+        self.shared = SharedExperts(model_dim, num_shared_experts, shared_intermediate_size, activation)
+        self.routed = RoutedExperts(model_dim, num_experts, num_experts_per_token, moe_intermediate_size, activation)
+
+    def init_weights(self):
+        self.shared.init_weights()
+        self.routed.init_weights()
+
+    def num_active_params(self):
+        """The parameters a token goes through: the shared experts and k of the routed ones (the router aside)."""
+        return self.shared.num_active_params() + self.routed.num_active_params()
 
     def forward(self, x):
-        shape = x.shape
-        x = x.reshape(-1, shape[-1])
-        if self.num_experts == 0:
-            y = self.shared(x)
-        elif self.num_shared_experts == 0:
-            y = self.routed(x)
-        else:
-            y = self.routed(x) + self.shared(x)
-        return y.view(shape)
+        return self.routed(x) + self.shared(x)
