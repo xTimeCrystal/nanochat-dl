@@ -597,10 +597,10 @@ while True:
         counts = orig_model.pop_moe_stats().cpu() # (layers, experts), one sync
         load = counts / counts.mean(1, keepdim=True) # relative to an even split
         moe_log = {"router/load_min": load.min().item(), "router/load_max": load.max().item(), "router/load_cv": load.std(dim=1, correction=0).mean().item()}
-        # per layer, named as Marin's train/router/layer_{i}/...: the busiest and the idlest expert, and the raw counts as a
+        # per layer, named as Marin's train/router/layer_{i}/...: the idlest and the busiest expert, and the raw counts as a
         # histogram with one bucket per expert (wandb takes at most 512 buckets)
         for i, (c, l) in enumerate(zip(counts.tolist(), load.tolist())):
-            moe_log |= {f"router/layer_{i}/load_max": max(l), f"router/layer_{i}/load_min": min(l),
+            moe_log |= {f"router/layer_{i}/load_min": min(l), f"router/layer_{i}/load_max": max(l),
                         f"router/layer_{i}/routing_hist": wandb.Histogram(np_histogram=(c, list(range(len(c) + 1))))}
         eta_str += f" | expert load: {moe_log['router/load_min']:.2f}-{moe_log['router/load_max']:.2f} cv {moe_log['router/load_cv']:.3f}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
