@@ -261,7 +261,7 @@ def routed_experts(x, fc, proj, sel, p, activation):
 # largest biased scores; the report takes the (k+1)-th, routed (below) their midpoint. The histogram covers every margin
 # there can be, as the report's does: +-span, span = 1 + the range of the biases, as a score is in (0, 1) and a cutoff lies
 # between two biased scores. (A fixed window caps a step at its half-width: an expert left without tokens recovers slowly.)
-BINS = 512
+BINS = 1024  # (the report: 1000. With 512, the first layers of a trained d16 balance worse within a micro-batch)
 
 
 def margin_counts(s, cutoff, bias, span):
