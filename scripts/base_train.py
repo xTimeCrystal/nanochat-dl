@@ -598,6 +598,7 @@ while True:
         load = counts / counts.mean(1, keepdim=True) # relative to an even split
         moe_log = {"moe/load_min": load.min().item(), "moe/load_max": load.max().item(), "moe/load_cv": load.std(dim=1, correction=0).mean().item(),
                    **{f"moe_layers/load_max_{i:02d}": v for i, v in enumerate(load.amax(dim=1).tolist())},
+                   **{f"moe_layers/load_min_{i:02d}": v for i, v in enumerate(load.amin(dim=1).tolist())},
                    # per layer, the raw counts as a histogram with one bucket per expert, as Marin's train/router/layer_{i}/routing_hist
                    # (a section of its own in wandb; wandb takes at most 512 buckets)
                    **{f"router/layer_{i:02d}/routing_hist": wandb.Histogram(np_histogram=(c, list(range(len(c) + 1)))) for i, c in enumerate(counts.tolist())}}
