@@ -1,14 +1,14 @@
 """
 Train model. From root directory of the project, run as:
 
-python -m scripts.base_train
+python -m scripts.base_train --run=<name>
 
 or distributed as:
 
-torchrun --nproc_per_node=8 -m scripts.base_train
+torchrun --nproc_per_node=8 -m scripts.base_train -- --run=<name>
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --total-batch-size=512 --num-iterations=20
+python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --total-batch-size=512 --num-iterations=20 --run=<name>
 """
 
 import os
@@ -40,7 +40,7 @@ print_banner()
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--run", type=str, default="dummy", help="wandb run name (required: a run not logged to wandb INVALIDATES THE RUN)")
 parser.add_argument("--wandb-project", type=str, default="nanochat", help="wandb project to log the run to")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
@@ -94,6 +94,9 @@ weakened = {"eval_tokens": args.eval_tokens < parser.get_default("eval_tokens"),
 for name, bad in weakened.items():
     if bad:
         raise ValueError(f"--{name.replace('_', '-')}={getattr(args, name)} reduces or disables an evaluation: this INVALIDATES THE RUN")
+# Every run is logged to wandb, online: a run that is not (no --run, or wandb offline or disabled) INVALIDATES THE RUN.
+if args.run == "dummy":
+    raise ValueError("--run=dummy: the run is not logged to wandb: this INVALIDATES THE RUN (give it a name)")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -113,6 +116,8 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=args.wandb_project, name=args.run, config=user_config)
+if master_process and (wandb_run.offline or wandb_run.disabled): # (e.g. WANDB_MODE=offline)
+    raise ValueError(f"wandb logs {wandb_run.settings.mode}, not online: this INVALIDATES THE RUN")
 # every wandb_run.log passes step=step: wandb's x-axis is then the training step, not the count of log calls
 
 # Flash Attention status
