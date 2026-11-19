@@ -151,15 +151,19 @@ class MLP(nn.Module):
         return x
 
 
+def moe_of(config):
+    """A layer's MoE (nanochat/moe.py) from the config: every field given, no defaults, no derived widths."""
+    from nanochat.moe import MoE # (Triton kernels: imported only with experts)
+    for name in ("num_experts_per_token", "moe_intermediate_size", "num_shared_experts"):
+        assert getattr(config, name) is not None, f"MoE: set {name} explicitly (no defaults, no derived widths)"
+    return MoE(config.n_embd, config.num_experts, config.num_experts_per_token, config.moe_intermediate_size, config.num_shared_experts)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        if config.num_experts:
-            from nanochat.moe import MoE # (Triton kernels: imported only with experts)
-            self.mlp = MoE(config)
-        else:
-            self.mlp = MLP(config)
+        self.mlp = moe_of(config) if config.num_experts else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -187,8 +191,7 @@ class AttnResMoE(nn.Module):
     """A layer's MoE as an AttnRes block."""
     def __init__(self, config):
         super().__init__()
-        from nanochat.moe import MoE # (Triton kernels: imported only with experts)
-        self.moe = MoE(config)
+        self.moe = moe_of(config)
 
     def forward(self, x, ves, cos_sin, kv_cache):
         return self.moe(x)
@@ -280,14 +283,8 @@ class GPT(nn.Module):
             if not self.config.num_experts:
                 torch.nn.init.uniform_(mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
                 torch.nn.init.zeros_(mlp.c_proj.weight)
-        for moe in self.moes(): # experts like the MLP, the router like the projections
-            torch.nn.init.uniform_(moe.router, -s, s)
-            torch.nn.init.uniform_(moe.wu, -s * 0.4, s * 0.4)
-            torch.nn.init.uniform_(moe.shared_up, -s * 0.4, s * 0.4)
-            torch.nn.init.zeros_(moe.wd)
-            torch.nn.init.zeros_(moe.shared_down)
-            moe.bias.zero_()
-            moe.load.zero_()
+        for moe in self.moes(): # experts like the MLP, the router like the attention's inputs
+            moe.init_weights()
 
         # Per-layer scalars
         n_layer = self.config.n_layer
@@ -425,8 +422,7 @@ class GPT(nn.Module):
 
     def num_active_expert_params(self):
         # expert parameters a token goes through: the shared experts and k routed ones
-        routed = lambda m: (m.wu.numel() + m.wd.numel()) * m.k // m.wu.shape[0]
-        return sum(m.shared_up.numel() + m.shared_down.numel() + routed(m) for m in self.moes())
+        return sum(m.num_active_params() for m in self.moes())
 
     def pop_moe_stats(self):
         # every expert's load since the last call relative to an even split, (layers, experts), summed over micro-batches

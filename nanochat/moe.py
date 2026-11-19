@@ -1,7 +1,5 @@
-"""
-Mixture of Experts in the style of Kimi K3 (config names as in moonshotai/Kimi-K3): MoE. Dropless, with fused Triton
-kernels: the activations must be bfloat16 on CUDA.
-"""
+"""Mixture of Experts in the style of Kimi K3 (github.com/MoonshotAI/Kimi-K3) as an MLP sublayer: MoE.
+The routed experts run on Triton kernels: with any, the activations must be bfloat16 on CUDA."""
 
 import torch
 import torch.nn as nn
@@ -12,8 +10,9 @@ import triton
 import triton.language as tl
 
 ROWS = dict(BM=128, BN=128, BK=32, num_warps=4, num_stages=3)  # tile of _rows
-WGRAD = dict(BM=128, BN=128, BK=32, num_warps=4, num_stages=3)  # tile of _wgrad
+WGRAD = dict(BM=128, BN=128, BK=64, num_warps=4, num_stages=2)  # tile of _wgrad
 WGRAD_LONG = dict(BK=128, num_stages=2)  # _wgrad on GPUs with >= 160 KB shared memory per block (A100, H100): faster there
+OVERLAP = True  # the backward runs its two independent GEMM pairs on two CUDA streams
 NONE, ACT, DZ = (tl.constexpr(i) for i in range(3))  # epilogues of _rows
 
 
@@ -59,8 +58,9 @@ def _rows(A, W, OUT, P, HID, ROWSLOT, TILES, KD, ND, NP,
 
 
 @triton.jit
-def _wgrad(L, Rt, OUT, ROWSLOT, OFF, MD, ND, K: tl.constexpr, LGATHER: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    # OUT[e] = sum over expert e's rows of L[row]^T Rt[row] (float32): a weight gradient, L or Rt gathered by token
+def _wgrad(L, Rt, OUT, ROWSLOT, OFF, MD, ND, LS, RS, K: tl.constexpr, LGATHER: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    # OUT[e] (MD, ND) = sum over expert e's rows of L[row, :MD]^T Rt[row, :ND] (float32): a weight gradient, L or Rt gathered
+    # by token; LS, RS: the row lengths of L and Rt
     pm, pn, e = tl.program_id(0), tl.program_id(1), tl.program_id(2)  # an expert's programs run together: its rows stay cached
     r1 = tl.load(OFF + e + 1).to(tl.int32)
     rm = pm * BM + tl.arange(0, BM)
@@ -73,8 +73,8 @@ def _wgrad(L, Rt, OUT, ROWSLOT, OFF, MD, ND, K: tl.constexpr, LGATHER: tl.conste
         tok = tl.load(ROWSLOT + rows, mask=mr, other=0) // K
         lrow = tok if LGATHER else rows
         rrow = rows if LGATHER else tok
-        a = tl.load(L + lrow[None, :] * MD + rm[:, None], mask=mm[:, None] & mr[None, :], other=0.0)
-        b = tl.load(Rt + rrow[:, None] * ND + rn[None, :], mask=mr[:, None] & mn[None, :], other=0.0)
+        a = tl.load(L + lrow[None, :] * LS + rm[:, None], mask=mm[:, None] & mr[None, :], other=0.0)
+        b = tl.load(Rt + rrow[:, None] * RS + rn[None, :], mask=mr[:, None] & mn[None, :], other=0.0)
         acc = tl.dot(a, b, acc)
     tl.store(OUT + (e.to(tl.int64) * MD + rm[:, None]) * ND + rn[None, :], acc, mask=mm[:, None] & mn[None, :])
 
@@ -143,16 +143,15 @@ def _rows_gemm(a, w, out, p, plan, epi=NONE, gather=False, scatter=False, wt=Fal
                            GATHER=gather, SCATTER=scatter, WT=wt, EPI=epi, **cfg)
 
 
-def _weight_grad(l, r, E, plan, lgather):
+def _weight_grad(l, r, out, plan, lgather):
     rowslot, off, tiles = plan
-    md, nd = l.shape[1], r.shape[1]
-    out = torch.empty(E, md, nd, device=l.device, dtype=torch.float32)
+    E, md, nd = out.shape
     big_smem = torch.cuda.get_device_properties(l.device).shared_memory_per_block_optin >= 160 * 1024
     cfg = dict(WGRAD, **WGRAD_LONG) if big_smem else WGRAD
     bm, m = _block(md, cfg, "BM")
     bn, n = _block(nd, cfg, "BN")
-    _wgrad[(m, n, E)](l, r, out, rowslot, off, md, nd, K=len(rowslot) // (l if lgather else r).shape[0], LGATHER=lgather, **dict(cfg, BM=bm, BN=bn))
-    return out
+    _wgrad[(m, n, E)](l, r, out, rowslot, off, md, nd, l.shape[1], r.shape[1], K=len(rowslot) // (l if lgather else r).shape[0],
+                      LGATHER=lgather, **dict(cfg, BM=bm, BN=bn))
 
 
 def _sum_slots(o, T, K, x=None):
@@ -167,62 +166,83 @@ def _sum_slots(o, T, K, x=None):
 
 
 # forward and backward as custom ops, so torch.compile compiles the model around them; the forward also returns what the
-# backward reuses (gated activations a, bf16 weights, plan)
+# backward reuses (gated activations a, plan). wu, wd: the weights, for their gradients' shapes; wub, wdb: what the kernels
+# read, see routed_experts (made outside the op: a layer called twice on one batch then makes them once).
 @torch.library.custom_op("moe::routed_experts", mutates_args=())
-def _experts(x: Tensor, wu: Tensor, wd: Tensor, sel: Tensor, p: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    (T, K), (E, H, D) = sel.shape, wu.shape
-    x, p = x.contiguous(), p.contiguous()
-    wu = wu.to(x.dtype, copy=True, memory_format=torch.contiguous_format)  # (copy: outputs may not alias inputs)
-    wd = wd.to(x.dtype, copy=True, memory_format=torch.contiguous_format)
+def _experts(x: Tensor, wu: Tensor, wd: Tensor, wub: Tensor, wdb: Tensor, sel: Tensor, p: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    (T, K), (E, H, D) = sel.shape, wub.shape
+    x, p, wub, wdb = x.contiguous(), p.contiguous(), wub.contiguous(), wdb.contiguous()
     plan = make_plan(sel, E)
     a = x.new_empty(T * K, H)
-    _rows_gemm(x, wu, a, p, plan, ACT, gather=True, wt=True)  # a = p * relu(x @ wu^T)^2
+    _rows_gemm(x, wub, a, p, plan, ACT, gather=True, wt=True)  # a = p * relu(x @ wu^T)^2
     o = x.new_empty(T * K, D)
-    _rows_gemm(a, wd, o, p, plan, scatter=True, wt=True)  # o = a @ wd^T
-    return _sum_slots(o, T, K), a, wu, wd, *plan
+    _rows_gemm(a, wdb, o, p, plan, scatter=True, wt=True)  # o = a @ wd^T
+    return _sum_slots(o, T, K), a, *plan
+
+
+_SIDE = {}  # device -> its second stream
 
 
 @torch.library.custom_op("moe::routed_experts_backward", mutates_args=())
-def _experts_backward(dy: Tensor, x: Tensor, p: Tensor, a: Tensor, wu: Tensor, wd: Tensor,
-                      rowslot: Tensor, off: Tensor, tiles: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    (T, K), (E, H, D) = p.shape, wu.shape
+def _experts_backward(dy: Tensor, x: Tensor, p: Tensor, a: Tensor, wub: Tensor, wdb: Tensor,
+                      rowslot: Tensor, off: Tensor, tiles: Tensor, hidden: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    (T, K), (E, _, D) = p.shape, wub.shape
     x, p, dy = x.contiguous(), p.contiguous(), dy.contiguous().to(x.dtype)
     plan = rowslot, off, tiles
-    dz = torch.empty_like(a)
-    _rows_gemm(dy, wd, dz, p, plan, DZ, gather=True, hid=a)  # dz = (dy @ wd) * da/dz
-    dxs = x.new_empty(T * K, D)
-    _rows_gemm(dz, wu, dxs, p, plan, scatter=True)  # dx per slot = dz @ wu
-    dwu = _weight_grad(dz, x, E, plan, lgather=False)  # dz^T x
-    dwd = _weight_grad(dy, a, E, plan, lgather=True)  # dy^T a
+    dz, dxs = torch.empty_like(a), x.new_empty(T * K, D)
+    dwu, dwd = x.new_empty(E, hidden, D, dtype=torch.float32), x.new_empty(E, D, hidden, dtype=torch.float32)
+    # Two pairs that do not depend on each other, one per stream: with few rows a launch's last wave of tiles is part
+    # empty, and the other stream's kernel fills it. Side stream: dwd, then dwu once dz is there.
+    main = torch.cuda.current_stream()
+    side = _SIDE.setdefault(x.device, torch.cuda.Stream(x.device)) if OVERLAP else main
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        _weight_grad(dy, a, dwd, plan, lgather=True)  # dy^T a
+    _rows_gemm(dy, wdb, dz, p, plan, DZ, gather=True, hid=a)  # dz = (dy @ wd) * da/dz
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        _weight_grad(dz, x, dwu, plan, lgather=False)  # dz^T x
+    _rows_gemm(dz, wub, dxs, p, plan, scatter=True)  # dx per slot = dz @ wu
+    main.wait_stream(side)  # (before the caller's stream can free or reuse what the side stream reads)
     # a is of degree 2 in z, so dL/dp = <da, a> / p = <dz @ wu, x> / (2 p): the slot's dx dotted with x
     dx, dots = _sum_slots(dxs, T, K, x)
     return dx, dwu, dwd, dots / (2 * p)
 
 
 @_experts.register_fake
-def _(x, wu, wd, sel, p):
+def _(x, wu, wd, wub, wdb, sel, p):
     R, E = sel.numel(), wu.shape[0]
-    return (x.new_empty(x.shape[0], wd.shape[1]), x.new_empty(R, wu.shape[1]), x.new_empty(wu.shape), x.new_empty(wd.shape),
+    return (x.new_empty(x.shape[0], wd.shape[1]), x.new_empty(R, wub.shape[1]),
             sel.new_empty(R), sel.new_empty(E + 1), sel.new_empty(triton.cdiv(R, ROWS["BM"]) + E, 3))
 
 
 @_experts_backward.register_fake
-def _(dy, x, p, a, wu, wd, rowslot, off, tiles):
-    f32 = dict(dtype=torch.float32)
-    return torch.empty_like(x), wu.new_empty(wu.shape, **f32), wd.new_empty(wd.shape, **f32), p.new_empty(p.shape, **f32)
+def _(dy, x, p, a, wub, wdb, rowslot, off, tiles, hidden):
+    (E, _, D), f32 = wub.shape, dict(dtype=torch.float32)
+    return torch.empty_like(x), wub.new_empty(E, hidden, D, **f32), wub.new_empty(E, D, hidden, **f32), p.new_empty(p.shape, **f32)
+
+
+def _setup(ctx, inputs, output):
+    x, wu, wd, wub, wdb, sel, p = inputs
+    ctx.save_for_backward(x, p, output[1], wub, wdb, *output[2:])
+    ctx.hidden = wu.shape[1]
 
 
 def _backward(ctx, dy, *unused):
-    dx, dwu, dwd, dp = _experts_backward(dy, *ctx.saved_tensors)
-    return dx, dwu, dwd, None, dp
+    dx, dwu, dwd, dp = _experts_backward(dy, *ctx.saved_tensors, ctx.hidden)
+    return dx, dwu, dwd, None, None, None, dp
 
 
-_experts.register_autograd(_backward, setup_context=lambda ctx, inputs, output: ctx.save_for_backward(inputs[0], inputs[4], *output[1:]))
+_experts.register_autograd(_backward, setup_context=_setup)
 
 
 def routed_experts(x, wu, wd, sel, p):
     # y = sum_k p[:, k] * expert_{sel[:, k]}(x); x (T, D) bf16, wu (E, H, D), wd (E, D, H), sel (T, K), p (T, K) float32
-    return _experts(x, wu, wd, sel, p)[0]
+    # The kernels read the weights in x's dtype with the hidden width filled up with zero units to a multiple of 16: at
+    # other widths their rows are not aligned and the GEMMs run at half speed.
+    pad = -wu.shape[1] % 16
+    wub, wdb = F.pad(wu, (0, 0, 0, pad)).to(x.dtype), F.pad(wd, (0, pad)).to(x.dtype)
+    return _experts(x, wu, wd, wub, wdb, sel, p)[0]
 
 
 # Quantile Balancing (Kimi K3 tech report, 2.3.3): after each batch, per expert, the bias that would have given it exactly
@@ -259,53 +279,88 @@ def _(counts, bias, k):
 
 
 class MoE(nn.Module):
-    """In place of a layer's MLP: y = shared(x) + sum over the token's k experts of p_k expert_k(x).
+    """An MLP sublayer, model_dim -> model_dim: y = shared(x) + sum over the token's k experts of p_k expert_k(x).
 
     s = sigmoid(x @ router^T)                    router scores, one per expert
     the token's experts: top-k of s + bias       the bias only steers the selection; Quantile Balancing sets it in training
     p = s[experts] / sum(s[experts])             mixture weights
-    expert(x) = relu(x @ wu^T)^2 @ wd^T          relu^2 as in the dense MLP; the shared experts are one such MLP
+    expert(x) = relu(x @ up^T)^2 @ down^T        relu^2 as in the dense MLP; the shared experts together are one such MLP
 
-    config.num_experts              routed experts
-    config.num_experts_per_token    k
-    config.moe_intermediate_size    hidden width of one expert
-    config.num_shared_experts       shared experts, on every token, each moe_intermediate_size wide (0: none)
-    config.n_embd                   model dimension
+    model_dim                width of x and y
+    num_experts              routed experts. 0: the shared experts alone, a standard MLP: no router, no kernel, any device.
+    num_experts_per_token    k, the routed experts of a token (0 without routed experts)
+    moe_intermediate_size    hidden width of one expert, routed or shared
+    num_shared_experts       shared experts, on every token (0: none)
 
-    The input is bfloat16 on CUDA (Triton kernels). Every routed (token, expert) pair is computed: nothing is dropped.
+    With routed experts the input is bfloat16 on CUDA (Triton kernels) and every routed (token, expert) pair is computed:
+    nothing is dropped. In training, each forward also sets the bias for the next batch from this one's routing.
     """
 
-    def __init__(self, config):
+    def __init__(self, model_dim: int, num_experts: int, num_experts_per_token: int, moe_intermediate_size: int, num_shared_experts: int):
         super().__init__()
-        for name in ("num_experts_per_token", "moe_intermediate_size", "num_shared_experts"):
-            assert getattr(config, name) is not None, f"MoE: set {name} explicitly (no defaults, no derived widths)"
-        E, D, H = config.num_experts, config.n_embd, config.moe_intermediate_size
-        self.k = config.num_experts_per_token
-        self.router = nn.Parameter(torch.empty(E, D))
-        self.wu = nn.Parameter(torch.empty(E, H, D))
-        self.wd = nn.Parameter(torch.empty(E, D, H))
-        self.shared_up = nn.Parameter(torch.empty(config.num_shared_experts * H, D))  # the shared experts as one MLP (as in Kimi K3)
-        self.shared_down = nn.Parameter(torch.empty(D, config.num_shared_experts * H))
-        self.register_buffer("bias", torch.zeros(E))  # selection bias, set by Quantile Balancing
-        self.register_buffer("load", torch.zeros(E), persistent=False)  # selections since the last GPT.pop_moe_stats()
+        assert (num_experts_per_token > 0) == (num_experts > 0) and num_experts_per_token < max(num_experts, 1), "MoE: 0 < num_experts_per_token < num_experts, or both 0"
+        assert num_experts + num_shared_experts > 0, "MoE: no experts at all"
+        E, K, D, H, S = num_experts, num_experts_per_token, model_dim, moe_intermediate_size, num_shared_experts
+        self.model_dim, self.num_experts, self.num_experts_per_token, self.num_shared_experts = D, E, K, S
+        if E > 0:
+            self.router = nn.Parameter(torch.empty(E, D))
+            self.wu = nn.Parameter(torch.empty(E, H, D))
+            self.wd = nn.Parameter(torch.empty(E, D, H))
+            self.register_buffer("bias", torch.zeros(E))  # selection bias, set by Quantile Balancing
+            self.register_buffer("load", torch.zeros(E), persistent=False)  # selections per expert since they were last read and zeroed
+        if S > 0:
+            self.shared_up = nn.Parameter(torch.empty(S * H, D))
+            self.shared_down = nn.Parameter(torch.empty(D, S * H))
 
-    def forward(self, x):
-        assert x.is_cuda and x.dtype == torch.bfloat16, "MoE runs Triton kernels: its input must be bfloat16 on CUDA"
-        shape = x.shape
-        x = x.reshape(-1, shape[-1])
+    def init_weights(self):
+        """nanochat's MLP init: up-projections uniform with std 0.4 / sqrt(model_dim), down-projections zero; the router
+        uniform with std 1 / sqrt(model_dim); the balancing bias and the load counts zero."""
+        s = 3 ** 0.5 * self.model_dim ** -0.5  # (uniform on (-s, s) has std 1 / sqrt(model_dim))
+        if self.num_experts > 0:
+            torch.nn.init.uniform_(self.router, -s, s)
+            torch.nn.init.uniform_(self.wu, -0.4 * s, 0.4 * s)
+            torch.nn.init.zeros_(self.wd)
+            self.bias.zero_()
+            self.load.zero_()
+        if self.num_shared_experts > 0:
+            torch.nn.init.uniform_(self.shared_up, -0.4 * s, 0.4 * s)
+            torch.nn.init.zeros_(self.shared_down)
+
+    def num_active_params(self):
+        """The parameters a token goes through: the shared experts and k of the routed ones (the router aside)."""
+        n = 0
+        if self.num_experts > 0:
+            n += (self.wu.numel() + self.wd.numel()) * self.num_experts_per_token // self.num_experts
+        if self.num_shared_experts > 0:
+            n += self.shared_up.numel() + self.shared_down.numel()
+        return n
+
+    def shared(self, x):
+        return F.linear(F.relu(F.linear(x, self.shared_up.to(x.dtype))).square(), self.shared_down.to(x.dtype))
+
+    def routed(self, x):
+        assert x.is_cuda and x.dtype == torch.bfloat16, "MoE runs its routed experts on Triton kernels: its input must be bfloat16 on CUDA"
+        k = self.num_experts_per_token
         s = torch.sigmoid(F.linear(x, self.router.to(x.dtype)).float())
-        top = (s + self.bias).topk(self.k + 1, dim=1)
-        sel = top.indices[:, :self.k]
+        top = (s + self.bias).topk(k + 1, dim=1)
+        sel = top.indices[:, :k]
         if self.training:  # balance for the next batch on this one's margins
             self.load.scatter_add_(0, sel.reshape(-1), torch.ones(sel.numel(), device=sel.device))
             # The cutoff: midway between the token's k-th and (k+1)-th largest biased scores. With few experts per token
             # the two are far apart, and at the (k+1)-th an expert the token did not select looks closer to getting in
             # than it is: loads then stay 10-30 % off an even split, against a few % at the midpoint.
-            cutoff = top.values[:, self.k - 1:].mean(1)
-            self.bias.copy_(quantile_balance(margin_counts(s.detach(), cutoff.detach(), self.bias), self.bias, self.k))
+            cutoff = top.values[:, k - 1:].mean(1)
+            self.bias.copy_(quantile_balance(margin_counts(s.detach(), cutoff.detach(), self.bias), self.bias, k))
         g = s.gather(1, sel)
-        p = g / g.sum(1, keepdim=True)
-        y = routed_experts(x, self.wu, self.wd, sel, p)
-        if self.shared_up.numel():
-            y = y + F.linear(F.relu(F.linear(x, self.shared_up.to(x.dtype))).square(), self.shared_down.to(x.dtype))
+        return routed_experts(x, self.wu, self.wd, sel, g / g.sum(1, keepdim=True))
+
+    def forward(self, x):
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        if self.num_experts == 0:
+            y = self.shared(x)
+        elif self.num_shared_experts == 0:
+            y = self.routed(x)
+        else:
+            y = self.routed(x) + self.shared(x)
         return y.view(shape)
