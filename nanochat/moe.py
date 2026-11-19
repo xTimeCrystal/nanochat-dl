@@ -1,13 +1,6 @@
 """
-Mixture of Experts in the style of Kimi K3 (config names as in moonshotai/Kimi-K3), dropless, with fused Triton kernels.
-
-    s = sigmoid(x @ router^T)                       router scores, one per expert
-    top-k experts by s + bias                       the bias only steers the selection (Quantile Balancing sets it)
-    p = s[top-k] / sum(s[top-k])                    mixture weights
-    y = shared(x) + sum_k p_k expert_k(x)           expert(x) = relu(x @ wu^T)**2 @ wd^T, relu^2 as in the dense MLP
-
-The routed (token, expert) rows are sorted by expert and cut into row tiles of one expert; the GEMMs gather their inputs
-and scatter their outputs through that permutation, so nothing is padded, dropped or copied, and nothing waits on the host.
+Mixture of Experts in the style of Kimi K3 (config names as in moonshotai/Kimi-K3): MoE. Dropless, with fused Triton
+kernels: the activations must be bfloat16 on CUDA.
 """
 
 import torch
@@ -232,17 +225,10 @@ def routed_experts(x, wu, wd, sel, p):
     return _experts(x, wu, wd, sel, p)[0]
 
 
-def routed_experts_reference(x, wu, wd, sel, p):
-    # the same in plain PyTorch, one expert at a time (CPU, MPS, float32)
-    y = x.new_zeros(x.shape[0], wd.shape[1])
-    for e in range(wu.shape[0]):
-        t, k = (sel == e).nonzero(as_tuple=True)
-        y.index_add_(0, t, p[t, k, None].to(x.dtype) * (torch.relu(x[t] @ wu[e].to(x.dtype).t()).square() @ wd[e].to(x.dtype).t()))
-    return y
-
-
-# Quantile Balancing (Kimi K3): after each batch, the bias that would have given every expert exactly k/E of the tokens,
-# read off a histogram of the routing margins (score + bias - the token's cutoff). Histograms add, so DDP all-reduces them.
+# Quantile Balancing (Kimi K3 tech report, 2.3.3): after each batch, per expert, the bias that would have given it exactly
+# k/E of the tokens with every token's cutoff held fixed, read off a histogram of the routing margins (score + bias - the
+# token's cutoff). Histograms add, so DDP all-reduces them. A token's cutoff may lie anywhere between its k-th and (k+1)-th
+# largest biased scores; the report takes the (k+1)-th, MoE.forward their midpoint (see there).
 BINS, SPAN = 512, 0.5
 
 
@@ -273,6 +259,22 @@ def _(counts, bias, k):
 
 
 class MoE(nn.Module):
+    """In place of a layer's MLP: y = shared(x) + sum over the token's k experts of p_k expert_k(x).
+
+    s = sigmoid(x @ router^T)                    router scores, one per expert
+    the token's experts: top-k of s + bias       the bias only steers the selection; Quantile Balancing sets it in training
+    p = s[experts] / sum(s[experts])             mixture weights
+    expert(x) = relu(x @ wu^T)^2 @ wd^T          relu^2 as in the dense MLP; the shared experts are one such MLP
+
+    config.num_experts              routed experts
+    config.num_experts_per_token    k
+    config.moe_intermediate_size    hidden width of one expert
+    config.num_shared_experts       shared experts, on every token, each moe_intermediate_size wide (0: none)
+    config.n_embd                   model dimension
+
+    The input is bfloat16 on CUDA (Triton kernels). Every routed (token, expert) pair is computed: nothing is dropped.
+    """
+
     def __init__(self, config):
         super().__init__()
         for name in ("num_experts_per_token", "moe_intermediate_size", "num_shared_experts"):
@@ -288,6 +290,7 @@ class MoE(nn.Module):
         self.register_buffer("load", torch.zeros(E), persistent=False)  # selections since the last GPT.pop_moe_stats()
 
     def forward(self, x):
+        assert x.is_cuda and x.dtype == torch.bfloat16, "MoE runs Triton kernels: its input must be bfloat16 on CUDA"
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         s = torch.sigmoid(F.linear(x, self.router.to(x.dtype)).float())
@@ -295,11 +298,14 @@ class MoE(nn.Module):
         sel = top.indices[:, :self.k]
         if self.training:  # balance for the next batch on this one's margins
             self.load.scatter_add_(0, sel.reshape(-1), torch.ones(sel.numel(), device=sel.device))
-            self.bias.copy_(quantile_balance(margin_counts(s.detach(), top.values[:, self.k].detach(), self.bias), self.bias, self.k))
+            # The cutoff: midway between the token's k-th and (k+1)-th largest biased scores. With few experts per token
+            # the two are far apart, and at the (k+1)-th an expert the token did not select looks closer to getting in
+            # than it is: loads then stay 10-30 % off an even split, against a few % at the midpoint.
+            cutoff = top.values[:, self.k - 1:].mean(1)
+            self.bias.copy_(quantile_balance(margin_counts(s.detach(), cutoff.detach(), self.bias), self.bias, self.k))
         g = s.gather(1, sel)
         p = g / g.sum(1, keepdim=True)
-        experts = routed_experts if x.is_cuda and x.dtype == torch.bfloat16 else routed_experts_reference
-        y = experts(x, self.wu, self.wd, sel, p)
+        y = routed_experts(x, self.wu, self.wd, sel, p)
         if self.shared_up.numel():
             y = y + F.linear(F.relu(F.linear(x, self.shared_up.to(x.dtype))).square(), self.shared_down.to(x.dtype))
         return y.view(shape)
