@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch import Tensor
+from torch.multiprocessing.reductions import StorageWeakRef
+from torch.optim.optimizer import register_optimizer_step_pre_hook, register_optimizer_step_post_hook
 import triton
 import triton.language as tl
 
@@ -58,9 +60,8 @@ def _rows(A, W, OUT, P, HID, ROWSLOT, TILES, KD, ND, NP,
 
 
 @triton.jit
-def _wgrad(L, Rt, OUT, ROWSLOT, OFF, MD, ND, LS, RS, K: tl.constexpr, LGATHER: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    # OUT[e] (MD, ND) = sum over expert e's rows of L[row, :MD]^T Rt[row, :ND] (float32): a weight gradient, L or Rt gathered
-    # by token; LS, RS: the row lengths of L and Rt
+def _wgrad(L, Rt, OUT, ROWSLOT, OFF, MD, ND, K: tl.constexpr, LGATHER: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    # OUT[e] (MD, ND) = sum over expert e's rows of L[row]^T Rt[row], summed in float32: a weight gradient, L or Rt gathered by token
     pm, pn, e = tl.program_id(0), tl.program_id(1), tl.program_id(2)  # an expert's programs run together: its rows stay cached
     r1 = tl.load(OFF + e + 1).to(tl.int32)
     rm = pm * BM + tl.arange(0, BM)
@@ -73,10 +74,10 @@ def _wgrad(L, Rt, OUT, ROWSLOT, OFF, MD, ND, LS, RS, K: tl.constexpr, LGATHER: t
         tok = tl.load(ROWSLOT + rows, mask=mr, other=0) // K
         lrow = tok if LGATHER else rows
         rrow = rows if LGATHER else tok
-        a = tl.load(L + lrow[None, :] * LS + rm[:, None], mask=mm[:, None] & mr[None, :], other=0.0)
-        b = tl.load(Rt + rrow[:, None] * RS + rn[None, :], mask=mr[:, None] & mn[None, :], other=0.0)
+        a = tl.load(L + lrow[None, :] * MD + rm[:, None], mask=mm[:, None] & mr[None, :], other=0.0)
+        b = tl.load(Rt + rrow[:, None] * ND + rn[None, :], mask=mr[:, None] & mn[None, :], other=0.0)
         acc = tl.dot(a, b, acc)
-    tl.store(OUT + (e.to(tl.int64) * MD + rm[:, None]) * ND + rn[None, :], acc, mask=mm[:, None] & mn[None, :])
+    tl.store(OUT + (e.to(tl.int64) * MD + rm[:, None]) * ND + rn[None, :], acc.to(OUT.dtype.element_ty), mask=mm[:, None] & mn[None, :])
 
 
 @triton.jit
@@ -120,9 +121,9 @@ def _combine(O, Y, X, DOTS, T, D, NP, K: tl.constexpr, DOT: tl.constexpr, BT: tl
 def make_plan(sel, E):
     # routing sel (T, K) -> rowslot (slot of each row, rows sorted by expert), off, tiles; all of routing-independent shape
     T, K = sel.shape
-    flat = sel.reshape(-1)
-    keys, rowslot = torch.sort(flat, stable=True)
-    counts = torch.diff(torch.searchsorted(keys, torch.arange(E + 1, device=flat.device)))  # (bincount syncs the host)
+    assert E < 2 ** 15, "MoE: at most 32767 experts (the plan sorts 16-bit keys)"
+    keys, rowslot = torch.sort(sel.reshape(-1).to(torch.int16), stable=True)  # (16-bit keys: the sort takes half the time)
+    counts = torch.diff(torch.searchsorted(keys, torch.arange(E + 1, device=sel.device, dtype=torch.int16)))  # (bincount syncs the host)
     off, tiles = counts.new_empty(E + 1), counts.new_empty(triton.cdiv(T * K, ROWS["BM"]) + E, 3)
     _tiles[(len(tiles),)](counts, off, tiles, E, EP=triton.next_power_of_2(E), BM=ROWS["BM"])
     return rowslot, off, tiles
@@ -150,8 +151,7 @@ def _weight_grad(l, r, out, plan, lgather):
     cfg = dict(WGRAD, **WGRAD_LONG) if big_smem else WGRAD
     bm, m = _block(md, cfg, "BM")
     bn, n = _block(nd, cfg, "BN")
-    _wgrad[(m, n, E)](l, r, out, rowslot, off, md, nd, l.shape[1], r.shape[1], K=len(rowslot) // (l if lgather else r).shape[0],
-                      LGATHER=lgather, **dict(cfg, BM=bm, BN=bn))
+    _wgrad[(m, n, E)](l, r, out, rowslot, off, md, nd, K=len(rowslot) // (l if lgather else r).shape[0], LGATHER=lgather, **dict(cfg, BM=bm, BN=bn))
 
 
 def _sum_slots(o, T, K, x=None):
@@ -165,15 +165,39 @@ def _sum_slots(o, T, K, x=None):
     return y if x is None else (y, dots.sum(1).view(T, K))
 
 
+_COPIES = {}  # (where wu and wd are stored) -> (their versions and shape then, weak references to their storages, their copies)
+
+
+def _kernel_weights(wu, wd, dtype):
+    # The weights in the activations' dtype, as the kernels read them. Weights of another dtype are copied, and the copies
+    # kept until the weights change: one cast per optimizer step, not one per micro-batch. A change shows in the weights'
+    # version counters. Writes through .data do not move those, so every optimizer step also drops the copies (below:
+    # before the step, which frees their memory for it, and after it).
+    cast = lambda w: w.to(dtype).contiguous()
+    if wu.dtype == dtype or torch.cuda.is_current_stream_capturing():  # (a CUDA graph replays the kernels, not this function: the cast has to be in it)
+        return cast(wu), cast(wd)
+    key, state = (wu.data_ptr(), wd.data_ptr()), (wu._version, wd._version, wu.shape, wu.stride(), dtype)
+    hit = _COPIES.get(key)
+    if hit is None or hit[0] != state or hit[1].expired() or hit[2].expired():
+        for gone in [k for k, v in _COPIES.items() if v[1].expired() or v[2].expired()]:
+            del _COPIES[gone]
+        hit = _COPIES[key] = (state, StorageWeakRef(wu.untyped_storage()), StorageWeakRef(wd.untyped_storage()), cast(wu), cast(wd))
+    return hit[3], hit[4]
+
+
+register_optimizer_step_pre_hook(lambda *_: _COPIES.clear())
+register_optimizer_step_post_hook(lambda *_: _COPIES.clear())
+
+
 # forward and backward as custom ops, so torch.compile compiles the model around them; the forward also returns what the
-# backward reuses (gated activations a, plan). wu, wd: the weights, for their gradients' shapes; wub, wdb: what the kernels
-# read, see routed_experts (made outside the op: a layer called twice on one batch then makes them once).
+# backward reuses (gated activations a, plan).
 @torch.library.custom_op("moe::routed_experts", mutates_args=())
-def _experts(x: Tensor, wu: Tensor, wd: Tensor, wub: Tensor, wdb: Tensor, sel: Tensor, p: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    (T, K), (E, H, D) = sel.shape, wub.shape
-    x, p, wub, wdb = x.contiguous(), p.contiguous(), wub.contiguous(), wdb.contiguous()
+def _experts(x: Tensor, wu: Tensor, wd: Tensor, sel: Tensor, p: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    (T, K), E, D = sel.shape, wu.shape[0], x.shape[1]
+    x, p = x.contiguous(), p.contiguous()
+    wub, wdb = _kernel_weights(wu, wd, x.dtype)
     plan = make_plan(sel, E)
-    a = x.new_empty(T * K, H)
+    a = x.new_empty(T * K, wu.shape[1])
     _rows_gemm(x, wub, a, p, plan, ACT, gather=True, wt=True)  # a = p * relu(x @ wu^T)^2
     o = x.new_empty(T * K, D)
     _rows_gemm(a, wdb, o, p, plan, scatter=True, wt=True)  # o = a @ wd^T
@@ -184,13 +208,14 @@ _SIDE = {}  # device -> its second stream
 
 
 @torch.library.custom_op("moe::routed_experts_backward", mutates_args=())
-def _experts_backward(dy: Tensor, x: Tensor, p: Tensor, a: Tensor, wub: Tensor, wdb: Tensor,
-                      rowslot: Tensor, off: Tensor, tiles: Tensor, hidden: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    (T, K), (E, _, D) = p.shape, wub.shape
+def _experts_backward(dy: Tensor, x: Tensor, p: Tensor, a: Tensor, wu: Tensor, wd: Tensor,
+                      rowslot: Tensor, off: Tensor, tiles: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    (T, K), D = p.shape, x.shape[1]
     x, p, dy = x.contiguous(), p.contiguous(), dy.contiguous().to(x.dtype)
+    wub, wdb = _kernel_weights(wu, wd, x.dtype)
     plan = rowslot, off, tiles
     dz, dxs = torch.empty_like(a), x.new_empty(T * K, D)
-    dwu, dwd = x.new_empty(E, hidden, D, dtype=torch.float32), x.new_empty(E, D, hidden, dtype=torch.float32)
+    dwu, dwd = wu.new_empty(wu.shape), wd.new_empty(wd.shape)
     # Two pairs that do not depend on each other, one per stream: with few rows a launch's last wave of tiles is part
     # empty, and the other stream's kernel fills it. Side stream: dwd, then dwu once dz is there.
     main = torch.cuda.current_stream()
@@ -210,45 +235,40 @@ def _experts_backward(dy: Tensor, x: Tensor, p: Tensor, a: Tensor, wub: Tensor, 
 
 
 @_experts.register_fake
-def _(x, wu, wd, wub, wdb, sel, p):
-    R, E = sel.numel(), wu.shape[0]
-    return (x.new_empty(x.shape[0], wd.shape[1]), x.new_empty(R, wub.shape[1]),
-            sel.new_empty(R), sel.new_empty(E + 1), sel.new_empty(triton.cdiv(R, ROWS["BM"]) + E, 3))
+def _(x, wu, wd, sel, p):
+    R, (E, H, D) = sel.numel(), wu.shape
+    return x.new_empty(x.shape), x.new_empty(R, H), sel.new_empty(R), sel.new_empty(E + 1), sel.new_empty(triton.cdiv(R, ROWS["BM"]) + E, 3)
 
 
 @_experts_backward.register_fake
-def _(dy, x, p, a, wub, wdb, rowslot, off, tiles, hidden):
-    (E, _, D), f32 = wub.shape, dict(dtype=torch.float32)
-    return torch.empty_like(x), wub.new_empty(E, hidden, D, **f32), wub.new_empty(E, D, hidden, **f32), p.new_empty(p.shape, **f32)
+def _(dy, x, p, a, wu, wd, rowslot, off, tiles):
+    return x.new_empty(x.shape), wu.new_empty(wu.shape), wd.new_empty(wd.shape), p.new_empty(p.shape)
 
 
 def _setup(ctx, inputs, output):
-    x, wu, wd, wub, wdb, sel, p = inputs
-    ctx.save_for_backward(x, p, output[1], wub, wdb, *output[2:])
-    ctx.hidden = wu.shape[1]
+    x, wu, wd, sel, p = inputs
+    ctx.save_for_backward(x, p, output[1], wu, wd, *output[2:])
 
 
 def _backward(ctx, dy, *unused):
-    dx, dwu, dwd, dp = _experts_backward(dy, *ctx.saved_tensors, ctx.hidden)
-    return dx, dwu, dwd, None, None, None, dp
+    dx, dwu, dwd, dp = _experts_backward(dy, *ctx.saved_tensors)
+    return dx, dwu, dwd, None, dp
 
 
 _experts.register_autograd(_backward, setup_context=_setup)
 
 
 def routed_experts(x, wu, wd, sel, p):
-    # y = sum_k p[:, k] * expert_{sel[:, k]}(x); x (T, D) bf16, wu (E, H, D), wd (E, D, H), sel (T, K), p (T, K) float32
-    # The kernels read the weights in x's dtype with the hidden width filled up with zero units to a multiple of 16: at
-    # other widths their rows are not aligned and the GEMMs run at half speed.
-    pad = -wu.shape[1] % 16
-    wub, wdb = F.pad(wu, (0, 0, 0, pad)).to(x.dtype), F.pad(wd, (0, pad)).to(x.dtype)
-    return _experts(x, wu, wd, wub, wdb, sel, p)[0]
+    # y = sum_k p[:, k] * expert_{sel[:, k]}(x); x (T, D) bf16, wu (E, H, D), wd (E, D, H), sel (T, K), p (T, K) float32.
+    # Any D and H, but the kernels load a row as vectors only if its length is a multiple of 16: at other widths the GEMMs
+    # run at half speed.
+    return _experts(x, wu, wd, sel, p)[0]
 
 
 # Quantile Balancing (Kimi K3 tech report, 2.3.3): after each batch, per expert, the bias that would have given it exactly
 # k/E of the tokens with every token's cutoff held fixed, read off a histogram of the routing margins (score + bias - the
 # token's cutoff). Histograms add, so DDP all-reduces them. A token's cutoff may lie anywhere between its k-th and (k+1)-th
-# largest biased scores; the report takes the (k+1)-th, MoE.forward their midpoint (see there).
+# largest biased scores; the report takes the (k+1)-th, MoE.routed their midpoint (see there).
 BINS, SPAN = 512, 0.5
 
 
@@ -292,14 +312,18 @@ class MoE(nn.Module):
     moe_intermediate_size    hidden width of one expert, routed or shared
     num_shared_experts       shared experts, on every token (0: none)
 
-    With routed experts the input is bfloat16 on CUDA (Triton kernels) and every routed (token, expert) pair is computed:
-    nothing is dropped. In training, each forward also sets the bias for the next batch from this one's routing.
+    With routed experts the input is bfloat16 on CUDA (Triton kernels), model_dim and moe_intermediate_size are multiples
+    of 16, and every routed (token, expert) pair is computed: nothing is dropped. In training, each forward also sets the
+    bias for the next batch from this one's routing, and the kernels read their own bfloat16 copies of the expert weights,
+    made again when the weights change: after an optimizer step or an in-place write, not after a write through .data.
     """
 
     def __init__(self, model_dim: int, num_experts: int, num_experts_per_token: int, moe_intermediate_size: int, num_shared_experts: int):
         super().__init__()
         assert (num_experts_per_token > 0) == (num_experts > 0) and num_experts_per_token < max(num_experts, 1), "MoE: 0 < num_experts_per_token < num_experts, or both 0"
         assert num_experts + num_shared_experts > 0, "MoE: no experts at all"
+        assert num_experts == 0 or (model_dim % 16 == 0 and moe_intermediate_size % 16 == 0), \
+            "MoE: with routed experts, model_dim and moe_intermediate_size must be multiples of 16 (at other widths the kernels' GEMMs run at half speed)"
         E, K, D, H, S = num_experts, num_experts_per_token, model_dim, moe_intermediate_size, num_shared_experts
         self.model_dim, self.num_experts, self.num_experts_per_token, self.num_shared_experts = D, E, K, S
         if E > 0:
@@ -352,7 +376,10 @@ class MoE(nn.Module):
             cutoff = top.values[:, k - 1:].mean(1)
             self.bias.copy_(quantile_balance(margin_counts(s.detach(), cutoff.detach(), self.bias), self.bias, k))
         g = s.gather(1, sel)
-        return routed_experts(x, self.wu, self.wd, sel, g / g.sum(1, keepdim=True))
+        # In training the op takes the weights as they are and keeps its own copies in x's dtype from one optimizer step to
+        # the next (_kernel_weights). In eval they are cast here on every call, as a Linear's are.
+        wu, wd = (self.wu, self.wd) if self.training else (self.wu.to(x.dtype), self.wd.to(x.dtype))
+        return routed_experts(x, wu, wd, sel, g / g.sum(1, keepdim=True))
 
     def forward(self, x):
         shape = x.shape
