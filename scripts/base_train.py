@@ -1,14 +1,14 @@
 """
 Train model. From root directory of the project, run as:
 
-python -m scripts.base_train
+python -m scripts.base_train --run=<name>
 
 or distributed as:
 
-torchrun --nproc_per_node=8 -m scripts.base_train
+torchrun --nproc_per_node=8 -m scripts.base_train -- --run=<name>
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --total-batch-size=512 --num-iterations=20 --run=<name>
 """
 
 import os
@@ -40,7 +40,7 @@ print_banner()
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--run", type=str, default="dummy", help="wandb run name (required: a run not logged to wandb INVALIDATES THE RUN)")
 parser.add_argument("--wandb-project", type=str, default="nanochat", help="wandb project to log the run to")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
@@ -52,6 +52,11 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
+parser.add_argument("--num-experts", type=int, default=0, help="routed experts per MLP (0 = the dense MLP); with it, set the four below")
+parser.add_argument("--num-experts-per-token", type=int, default=None, help="routed experts a token goes through")
+parser.add_argument("--moe-intermediate-size", type=int, default=None, help="hidden width of one routed expert")
+parser.add_argument("--num-shared-experts", type=int, default=None, help="shared experts, which every token goes through")
+parser.add_argument("--shared-intermediate-size", type=int, default=None, help="hidden width of one shared expert")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--attn-res", action="store_true", help="Attention Residuals: every sublayer reads a softmax-over-depth mixture of all earlier outputs instead of a residual stream")
 # Training horizon (only one used, in order of precedence)
@@ -73,7 +78,7 @@ parser.add_argument("--resume-from-step", type=int, default=-1, help="resume tra
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
+parser.add_argument("--core-metric-every", type=int, default=250, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
@@ -81,6 +86,17 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+# A run evaluated on less than the default evaluation is not comparable to any other run: reducing an evaluation or
+# disabling it (the validation loss, the CORE metric) INVALIDATES THE RUN. Do not do either, least of all to save time.
+weakened = {"eval_tokens": args.eval_tokens < parser.get_default("eval_tokens"), "eval_every": args.eval_every <= 0, # (<= 0: disabled)
+            "core_metric_max_per_task": 0 <= args.core_metric_max_per_task < parser.get_default("core_metric_max_per_task"), # (< 0: every example)
+            "core_metric_every": args.core_metric_every <= 0}
+for name, bad in weakened.items():
+    if bad:
+        raise ValueError(f"--{name.replace('_', '-')}={getattr(args, name)} reduces or disables an evaluation: this INVALIDATES THE RUN")
+# Every run is logged to wandb, online: a run that is not (no --run, or wandb offline or disabled) INVALIDATES THE RUN.
+if args.run == "dummy":
+    raise ValueError("--run=dummy: the run is not logged to wandb: this INVALIDATES THE RUN (give it a name)")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -100,6 +116,8 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=args.wandb_project, name=args.run, config=user_config)
+if master_process and (wandb_run.offline or wandb_run.disabled): # (e.g. WANDB_MODE=offline)
+    raise ValueError(f"wandb logs {wandb_run.settings.mode}, not online: this INVALIDATES THE RUN")
 # every wandb_run.log passes step=step: wandb's x-axis is then the training step, not the count of log calls
 
 # Flash Attention status
@@ -129,17 +147,22 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
+def build_model_meta(depth, dense=False):
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data). dense: with the dense MLP whatever the flags."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    mlp = dict(num_shared_experts=1, shared_intermediate_size=4 * model_dim) # the dense MLP
+    if args.num_experts > 0 and not dense: # every size as given: no defaults
+        mlp = dict(num_shared_experts=args.num_shared_experts, shared_intermediate_size=args.shared_intermediate_size,
+                   num_experts=args.num_experts, num_experts_per_token=args.num_experts_per_token, moe_intermediate_size=args.moe_intermediate_size)
+        assert None not in mlp.values(), "--num-experts needs --num-experts-per-token, --moe-intermediate-size, --num-shared-experts, --shared-intermediate-size"
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern, attn_res=args.attn_res,
+        window_pattern=args.window_pattern, attn_res=args.attn_res, **mlp,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -266,13 +289,13 @@ print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 def get_scaling_params(m):
     # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
     params_counts = m.num_scaling_params()
-    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
+    scaling_params = params_counts['active_matrices'] + params_counts['lm_head'] # (active: an MoE scales like the dense model of its FLOPs)
     return scaling_params
 num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+d12_ref = build_model_meta(12, dense=True) # creates the model on meta device (the dense d12 whatever the flags)
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
@@ -569,6 +592,17 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    moe_log = {}
+    if args.num_experts > 0: # the tokens routed to every expert over this step's micro-batches and ranks
+        counts = orig_model.pop_moe_stats().cpu() # (layers, experts), one sync
+        load = counts / counts.mean(1, keepdim=True) # relative to an even split
+        moe_log = {"router/load_min": load.min().item(), "router/load_max": load.max().item(), "router/load_cv": load.std(dim=1, correction=0).mean().item()}
+        # per layer, named as Marin's train/router/layer_{i}/...: the idlest and the busiest expert, and the raw counts as a
+        # histogram with one bucket per expert (wandb takes at most 512 buckets)
+        for i, (c, l) in enumerate(zip(counts.tolist(), load.tolist())):
+            moe_log |= {f"router/layer_{i}/load_min": min(l), f"router/layer_{i}/load_max": max(l),
+                        f"router/layer_{i}/routing_hist": wandb.Histogram(np_histogram=(c, list(range(len(c) + 1))))}
+        eta_str += f" | expert load: {moe_log['router/load_min']:.2f}-{moe_log['router/load_max']:.2f} cv {moe_log['router/load_cv']:.3f}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     # parameter norms per optimizer group, in fp32 (the embeddings are stored in bf16); the Muon groups share "matrix"
     param_sq = {}
@@ -588,6 +622,7 @@ while True:
         "optim/muon_momentum": muon_momentum,
         "optim/muon_weight_decay": muon_weight_decay,
         "grad/norm/total": optimizer.grad_norm.item(),
+        **moe_log,
         "params/norm/total": math.sqrt(sum(norm ** 2 for norm in param_norms.values())),
         **{f"params/norm/{name}": norm for name, norm in param_norms.items()},
         "data/epoch": dataloader_state_dict["epoch"],
