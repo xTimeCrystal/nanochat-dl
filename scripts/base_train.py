@@ -52,11 +52,11 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--num-experts", type=int, default=0, help="MLP sublayer (nanochat/moe.py): routed experts per layer. 0 = the dense MLP: 1 shared expert 4 * model_dim wide")
-parser.add_argument("--num-experts-per-token", type=int, default=None, help="routed experts per token (required with --num-experts)")
-parser.add_argument("--moe-intermediate-size", type=int, default=None, help="hidden width of one routed expert (required with --num-experts)")
-parser.add_argument("--num-shared-experts", type=int, default=None, help="shared experts, which every token goes through (required with --num-experts)")
-parser.add_argument("--shared-intermediate-size", type=int, default=None, help="hidden width of one shared expert (required with --num-experts)")
+parser.add_argument("--num-experts", type=int, default=0, help="routed experts per MLP (0 = the dense MLP); with it, set the four below")
+parser.add_argument("--num-experts-per-token", type=int, default=None, help="routed experts a token goes through")
+parser.add_argument("--moe-intermediate-size", type=int, default=None, help="hidden width of one routed expert")
+parser.add_argument("--num-shared-experts", type=int, default=None, help="shared experts, which every token goes through")
+parser.add_argument("--shared-intermediate-size", type=int, default=None, help="hidden width of one shared expert")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--attn-res", action="store_true", help="Attention Residuals: every sublayer reads a softmax-over-depth mixture of all earlier outputs instead of a residual stream")
 # Training horizon (only one used, in order of precedence)
@@ -86,20 +86,12 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
-
 # A run evaluated on less than the default evaluation is not comparable to any other run: reducing it INVALIDATES THE RUN.
 # Do not lower these to save time; disable an eval (--eval-every=-1, --core-metric-every=-1) instead, and say so.
-for flag, default, value in [("eval-tokens", parser.get_default("eval_tokens"), args.eval_tokens),
-                             ("core-metric-max-per-task", parser.get_default("core_metric_max_per_task"), args.core_metric_max_per_task)]:
+for name in ("eval_tokens", "core_metric_max_per_task"):
+    value, default = getattr(args, name), parser.get_default(name)
     if value != -1 and value < default:
-        raise ValueError(f"--{flag}={value} is below the default {default}: this INVALIDATES THE RUN (its evals are not comparable)")
-# Routed experts come with their whole layer spelled out: no defaults, no derived widths.
-moe_flags = {name: getattr(args, name.replace("-", "_")) for name in ("num-experts-per-token", "moe-intermediate-size", "num-shared-experts", "shared-intermediate-size")}
-unset = [f"--{name}" for name, value in moe_flags.items() if value is None]
-if args.num_experts > 0 and unset:
-    raise ValueError(f"with --num-experts, also set {', '.join(unset)}")
-if args.num_experts == 0 and len(unset) < len(moe_flags):
-    raise ValueError("--num-experts-per-token, --moe-intermediate-size, --num-shared-experts and --shared-intermediate-size describe a layer with routed experts: set --num-experts too")
+        raise ValueError(f"--{name.replace('_', '-')}={value} is below the default {default}: this INVALIDATES THE RUN")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -149,18 +141,17 @@ print0(f"Vocab size: {vocab_size:,}")
 # Initialize the Model
 
 def build_model_meta(depth, dense=False):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data). dense: with the dense MLP whatever
-    the flags say, for the reference model the hyperparameter scalings are relative to."""
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data). dense: with the dense MLP whatever the flags."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
-    if dense or args.num_experts == 0: # the dense MLP: 1 shared expert 4 * model_dim wide, no routed experts
-        mlp = dict(num_experts=0, num_experts_per_token=0, moe_intermediate_size=0, num_shared_experts=1, shared_intermediate_size=4 * model_dim)
-    else: # every field as given: no defaults, no derived widths
-        mlp = dict(num_experts=args.num_experts, num_experts_per_token=args.num_experts_per_token, moe_intermediate_size=args.moe_intermediate_size,
-                   num_shared_experts=args.num_shared_experts, shared_intermediate_size=args.shared_intermediate_size)
+    mlp = dict(num_shared_experts=1, shared_intermediate_size=4 * model_dim) # the dense MLP
+    if args.num_experts > 0 and not dense: # every size as given: no defaults
+        mlp = dict(num_shared_experts=args.num_shared_experts, shared_intermediate_size=args.shared_intermediate_size,
+                   num_experts=args.num_experts, num_experts_per_token=args.num_experts_per_token, moe_intermediate_size=args.moe_intermediate_size)
+        assert None not in mlp.values(), "--num-experts needs --num-experts-per-token, --moe-intermediate-size, --num-shared-experts, --shared-intermediate-size"
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
@@ -297,7 +288,7 @@ num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12, dense=True) # creates the model on meta device (always the dense d12)
+d12_ref = build_model_meta(12, dense=True) # creates the model on meta device (the dense d12 whatever the flags)
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
@@ -595,12 +586,14 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     moe_log = {}
-    if orig_model.config.num_experts > 0: # tokens per routed expert relative to an even split, over this step's micro-batches and ranks
-        load = orig_model.pop_moe_stats() # (layers, experts)
-        stats = torch.cat([torch.stack([load.min(), load.max(), load.std(dim=1).mean()]), load.amax(dim=1)]).tolist() # one sync
-        moe_log = {"moe/load_min": stats[0], "moe/load_max": stats[1], "moe/load_cv": stats[2],
-                   **{f"moe_layers/load_max_{i:02d}": v for i, v in enumerate(stats[3:])}}
-        eta_str += f" | expert load: {stats[0]:.2f}-{stats[1]:.2f} cv {stats[2]:.3f}"
+    if args.num_experts > 0: # the tokens routed to every expert over this step's micro-batches and ranks
+        counts = orig_model.pop_moe_stats().cpu() # (layers, experts), one sync
+        load = counts / counts.mean(1, keepdim=True) # relative to an even split
+        moe_log = {"moe/load_min": load.min().item(), "moe/load_max": load.max().item(), "moe/load_cv": load.std(dim=1, correction=0).mean().item(),
+                   **{f"moe_layers/load_max_{i:02d}": v for i, v in enumerate(load.amax(dim=1).tolist())},
+                   # per layer, the raw counts as a histogram with one bucket per expert, as Marin's routing_hist (wandb: at most 512 buckets)
+                   **{f"moe_layers/routing_hist_{i:02d}": wandb.Histogram(np_histogram=(c, list(range(len(c) + 1)))) for i, c in enumerate(counts.tolist())}}
+        eta_str += f" | expert load: {moe_log['moe/load_min']:.2f}-{moe_log['moe/load_max']:.2f} cv {moe_log['moe/load_cv']:.3f}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     # parameter norms per optimizer group, in fp32 (the embeddings are stored in bf16); the Muon groups share "matrix"
     param_sq = {}

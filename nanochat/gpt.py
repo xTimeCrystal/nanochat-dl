@@ -22,7 +22,6 @@ import torch.distributed as dist
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
-from nanochat.moe import MoE, Linear
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
@@ -42,19 +41,27 @@ class GPTConfig:
     # Attention Residuals (nanochat/attn_res.py): every attention and MLP reads a softmax-over-depth mixture of the
     # embedding and all earlier sublayer outputs instead of a residual stream (no resid/x0 lambdas, no backout)
     attn_res: bool = False
-    # The MLP sublayer is a Mixture of Experts (nanochat/moe.py): shared experts that every token goes through plus routed
-    # experts, of which a token goes through num_experts_per_token. The two sizes are the hidden widths of one routed and
-    # of one shared expert. The dense MLP is 1 shared expert 4 * n_embd wide and no routed experts: set it, there is no
-    # default for the width.
+    # The MLP is a Mixture of Experts (Kimi K3 style): shared experts, which every token goes through, plus routed experts
+    # (nanochat/moe.py), of which a token goes through num_experts_per_token. The sizes are one expert's hidden width.
+    # The dense MLP is 1 shared expert 4 * n_embd wide.
+    num_shared_experts: int = 0
+    shared_intermediate_size: int = 0
     num_experts: int = 0
     num_experts_per_token: int = 0
     moe_intermediate_size: int = 0
-    num_shared_experts: int = 1
-    shared_intermediate_size: int | None = None
+    activation: str = "relu2" # of every expert's hidden units: "relu2" (relu squared) or "silu"
 
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
+
+class Linear(nn.Linear):
+    """nn.Linear that casts weights to match input dtype in forward.
+    Replaces autocast: master weights stay fp32 for optimizer precision,
+    but matmuls run in the activation dtype (typically bf16 from embeddings)."""
+    def forward(self, x):
+        return F.linear(x, self.weight.to(dtype=x.dtype))
+
 
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
@@ -134,13 +141,37 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class MLP(MoE):
-    """The MLP sublayer: the config's Mixture of Experts (nanochat/moe.py) with relu^2. 1 shared expert 4 * n_embd wide and
-    no routed experts is the dense MLP."""
+class MLP(nn.Module):
+    """y = shared(x) + routed(x), every expert x -> act(x @ fc^T) @ proj^T.
+    shared(x): the sum of the shared experts, for every token. Side by side they are one MLP, c_fc and c_proj.
+    routed(x): the sum over the token's num_experts_per_token routed experts of p_k expert_k(x) (nanochat/moe.py)."""
     def __init__(self, config):
-        assert config.shared_intermediate_size is not None, "GPTConfig: set shared_intermediate_size (the dense MLP: num_shared_experts=1, shared_intermediate_size=4 * n_embd)"
-        super().__init__(config.n_embd, config.num_experts, config.num_experts_per_token, config.moe_intermediate_size,
-                         config.num_shared_experts, config.shared_intermediate_size, activation="relu2")
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.num_experts_per_token = config.num_experts_per_token
+        self.activation = config.activation
+        assert self.activation in ("relu2", "silu")
+        hidden = config.num_shared_experts * config.shared_intermediate_size
+        assert hidden > 0 or self.num_experts > 0 # (the dense MLP: num_shared_experts=1, shared_intermediate_size=4 * n_embd)
+        self.c_fc = Linear(config.n_embd, hidden, bias=False)
+        self.c_proj = Linear(hidden, config.n_embd, bias=False)
+        if self.num_experts > 0: # routed experts: a router, and stacks (num_experts, out, in) of their c_fc and c_proj
+            assert 0 < self.num_experts_per_token <= self.num_experts and config.moe_intermediate_size > 0
+            assert config.n_embd % 16 == 0 and config.moe_intermediate_size % 16 == 0 # (else the kernels run at half speed)
+            self.router = Linear(config.n_embd, self.num_experts, bias=False)
+            self.e_fc = nn.Parameter(torch.empty(self.num_experts, config.moe_intermediate_size, config.n_embd))
+            self.e_proj = nn.Parameter(torch.empty(self.num_experts, config.n_embd, config.moe_intermediate_size))
+            self.register_buffer("bias", torch.zeros(self.num_experts)) # selection bias, set by Quantile Balancing
+            self.register_buffer("load", torch.zeros(self.num_experts), persistent=False) # selections per expert since they were last read
+
+    def forward(self, x):
+        y = self.c_fc(x)
+        y = F.silu(y) if self.activation == "silu" else F.relu(y).square()
+        y = self.c_proj(y)
+        if self.num_experts > 0:
+            from nanochat.moe import routed # (Triton kernels: imported only in this mode)
+            y = y + routed(self, x)
+        return y
 
 
 class Block(nn.Module):
@@ -253,7 +284,14 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(attn.c_proj.weight) # projections are zero
-            mlp.init_weights() # c_fc uniform at 0.4x the scale, c_proj zero; routed experts alike, their router like c_q
+            torch.nn.init.uniform_(mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+            torch.nn.init.zeros_(mlp.c_proj.weight)
+            if self.config.num_experts > 0: # routed experts like c_fc and c_proj, their router like c_q
+                torch.nn.init.uniform_(mlp.router.weight, -s, s)
+                torch.nn.init.uniform_(mlp.e_fc, -s * 0.4, s * 0.4)
+                torch.nn.init.zeros_(mlp.e_proj)
+                torch.nn.init.zeros_(mlp.bias)
+                torch.nn.init.zeros_(mlp.load)
 
         # Per-layer scalars
         n_layer = self.config.n_layer
@@ -380,21 +418,20 @@ class GPT(nn.Module):
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
         """
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
-        if self.config.num_experts > 0: # routed experts are not Linear modules: the router and the k experts a token goes through
-            k, E = self.config.num_experts_per_token, self.config.num_experts
-            matmul_params += sum(mlp.router.numel() + (mlp.wu.numel() + mlp.wd.numel()) * k // E for _, mlp in self.layers())
+        c = self.config # routed experts are not Linear modules: a token goes through num_experts_per_token per layer
+        matmul_params += c.n_layer * c.num_experts_per_token * 2 * c.moe_intermediate_size * c.n_embd
         return matmul_params
 
     def pop_moe_stats(self):
-        # every routed expert's load since the last call relative to an even split, (layers, experts), summed over
-        # micro-batches and ranks (an all-reduce: every rank calls it), then reset
+        # the tokens routed to every expert since the last call, (layers, experts), summed over micro-batches and
+        # ranks (an all-reduce: every rank calls it), then reset
         mlps = [mlp for _, mlp in self.layers()]
-        load = torch.stack([mlp.load for mlp in mlps])
+        counts = torch.stack([mlp.load for mlp in mlps])
         if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(load)
+            dist.all_reduce(counts)
         for mlp in mlps:
             mlp.load.zero_()
-        return load / load.mean(1, keepdim=True).clamp_min(1)
+        return counts
 
     def estimate_decode_flops(self, context_len):
         """
@@ -454,16 +491,15 @@ class GPT(nn.Module):
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters()) - (self.transformer.h.pseudo_queries.numel() if self.config.attn_res else 0)
         scalars = sum(p.numel() for p in self.scalar_params())
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        # the matrices a token goes through (routers aside): with routed experts, the training horizon and hyperparameters follow these
-        mlps = [mlp for _, mlp in self.layers()]
-        active_matrices = transformer_matrices - sum(p.numel() for mlp in mlps for p in mlp.parameters()) + sum(mlp.num_active_params() for mlp in mlps)
+        c = self.config # the matrices a token goes through: all but the routers and the routed experts it is not sent to
+        idle = c.n_layer * c.n_embd * (c.num_experts + 2 * (c.num_experts - c.num_experts_per_token) * c.moe_intermediate_size)
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
-            'active_matrices': active_matrices,
+            'active_matrices': transformer_matrices - idle,
             'scalars': scalars,
             'total': total,
         }
@@ -479,8 +515,8 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         attn_res = self.config.attn_res
-        # (a router of routed experts is a matrix too: under AdamW its scores saturate)
-        matrix_params = [p for p in self.transformer.h.parameters() if not attn_res or p is not self.transformer.h.pseudo_queries]
+        # (a router of routed experts is a matrix too: under AdamW its scores saturate; without shared experts c_fc and c_proj are empty)
+        matrix_params = [p for p in self.transformer.h.parameters() if p.numel() > 0 and (not attn_res or p is not self.transformer.h.pseudo_queries)]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -488,7 +524,7 @@ class GPT(nn.Module):
         x0_params = [] if attn_res else [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda] + ([] if attn_res else [self.backout_lambda])
         attn_res_params = [self.transformer.h.pseudo_queries] if attn_res else []
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(attn_res_params)
+        assert sum(p.numel() > 0 for p in self.parameters()) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(attn_res_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
