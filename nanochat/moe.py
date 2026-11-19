@@ -33,7 +33,7 @@ class MoE(nn.Module):
 
     model_dim                  width of x and y
     num_experts                routed experts (0: none)
-    num_experts_per_token      k, the routed experts of a token (0 without routed experts)
+    num_experts_per_token      k, the routed experts of a token, at most num_experts (0 without routed experts)
     moe_intermediate_size      hidden width of one routed expert (0 without routed experts)
     num_shared_experts         shared experts (0: none)
     shared_intermediate_size   hidden width of one shared expert (0 without shared experts)
@@ -42,9 +42,11 @@ class MoE(nn.Module):
     Without routed experts this is a standard MLP on any device and dtype: num_shared_experts = 1 and
     shared_intermediate_size = 4 * model_dim with "relu2" is nanochat's, c_fc and c_proj its two linear layers.
     With routed experts the input is bfloat16 on CUDA (Triton kernels), model_dim and moe_intermediate_size are multiples
-    of 16, and every routed (token, expert) pair is computed: nothing is dropped. In training, each forward also sets the
-    bias for the next batch from this one's routing, and the kernels read their own bfloat16 copies of the routed weights,
-    made again when the weights change: after an optimizer step or an in-place write, not after a write through .data.
+    of 16, and every routed (token, expert) pair is computed: nothing is dropped. With k = num_experts every token goes
+    through every routed expert, and one routed expert alone (p = 1) is the standard MLP on the kernels. In training, each
+    forward also sets the bias for the next batch from this one's routing, and the kernels read their own bfloat16 copies
+    of the routed weights, made again when the weights change: after an optimizer step or an in-place write, not after a
+    write through .data.
     """
 
     def __init__(self, model_dim: int, num_experts: int, num_experts_per_token: int, moe_intermediate_size: int,
@@ -62,7 +64,7 @@ class MoE(nn.Module):
         else:
             assert W == 0, "MoE: without shared experts, shared_intermediate_size is 0"
         if E > 0:
-            assert 0 < K < E, "MoE: with routed experts, 0 < num_experts_per_token < num_experts"
+            assert 0 < K <= E, "MoE: with routed experts, 0 < num_experts_per_token <= num_experts"
             assert H > 0 and D % 16 == 0 and H % 16 == 0, \
                 "MoE: with routed experts, model_dim and moe_intermediate_size must be multiples of 16 (at other widths the kernels' GEMMs run at half speed)"
             import nanochat.moe_kernels  # (Triton: needed only with routed experts)
@@ -106,13 +108,14 @@ class MoE(nn.Module):
         shape, k = x.shape, self.num_experts_per_token
         x = x.reshape(-1, shape[-1])
         s = torch.sigmoid(F.linear(x, self.router.to(x.dtype)).float())
-        top = (s + self.bias).topk(k + 1, dim=1)
+        top = (s + self.bias).topk(min(k + 1, self.num_experts), dim=1)  # (the k selected and, if there is one, the next)
         sel = top.indices[:, :k]
         if self.training:  # balance for the next batch on this one's margins
             self.load.scatter_add_(0, sel.reshape(-1), torch.ones(sel.numel(), device=sel.device))
-            # The cutoff: midway between the token's k-th and (k+1)-th largest biased scores. With few experts per token
-            # the two are far apart, and at the (k+1)-th an expert the token did not select looks closer to getting in
-            # than it is: loads then stay 10-30 % off an even split, against a few % at the midpoint.
+            # The cutoff: midway between the token's k-th and (k+1)-th largest biased scores (the k-th alone when every
+            # expert is selected). With few experts per token the two are far apart, and at the (k+1)-th an expert the
+            # token did not select looks closer to getting in than it is: loads then stay 10-30 % off an even split,
+            # against a few % at the midpoint.
             cutoff = top.values[:, k - 1:].mean(1)
             self.bias.copy_(quantile_balance(margin_counts(s.detach(), cutoff.detach(), self.bias), self.bias, k))
         g = s.gather(1, sel)

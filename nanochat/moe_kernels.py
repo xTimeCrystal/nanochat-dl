@@ -167,8 +167,6 @@ def _weight_grad(l, r, out, plan, lgather):
 
 def _sum_slots(o, T, K, x=None):
     D = o.shape[1]
-    if K == 1 and x is None:
-        return o
     n = triton.cdiv(D, 256)
     y = o.new_empty(T, D)
     dots = y if x is None else o.new_empty(T * K, n, dtype=torch.float32)
@@ -264,6 +262,7 @@ def _setup(ctx, inputs, output):
     x, wu, wd, sel, p, silu = inputs
     ctx.save_for_backward(x, p, *output[1:3], wu, wd, *output[3:])
     ctx.silu = silu
+    ctx.set_materialize_grads(False)  # (only y gets a gradient: no zeros the size of a and z for the other outputs)
 
 
 def _backward(ctx, dy, *unused):
