@@ -8,7 +8,7 @@ or distributed as:
 torchrun --nproc_per_node=8 -m scripts.base_train
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --total-batch-size=512 --num-iterations=20
 """
 
 import os
@@ -86,12 +86,14 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
-# A run evaluated on less than the default evaluation is not comparable to any other run: reducing it INVALIDATES THE RUN.
-# Do not lower these to save time; disable an eval (--eval-every=-1, --core-metric-every=-1) instead, and say so.
-for name in ("eval_tokens", "core_metric_max_per_task"):
-    value, default = getattr(args, name), parser.get_default(name)
-    if value != -1 and value < default:
-        raise ValueError(f"--{name.replace('_', '-')}={value} is below the default {default}: this INVALIDATES THE RUN")
+# A run evaluated on less than the default evaluation is not comparable to any other run: reducing an evaluation or
+# disabling it (the validation loss, the CORE metric) INVALIDATES THE RUN. Do not do either, least of all to save time.
+weakened = {"eval_tokens": args.eval_tokens < parser.get_default("eval_tokens"), "eval_every": args.eval_every <= 0, # (<= 0: disabled)
+            "core_metric_max_per_task": 0 <= args.core_metric_max_per_task < parser.get_default("core_metric_max_per_task"), # (< 0: every example)
+            "core_metric_every": args.core_metric_every <= 0}
+for name, bad in weakened.items():
+    if bad:
+        raise ValueError(f"--{name.replace('_', '-')}={getattr(args, name)} reduces or disables an evaluation: this INVALIDATES THE RUN")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -591,8 +593,9 @@ while True:
         load = counts / counts.mean(1, keepdim=True) # relative to an even split
         moe_log = {"moe/load_min": load.min().item(), "moe/load_max": load.max().item(), "moe/load_cv": load.std(dim=1, correction=0).mean().item(),
                    **{f"moe_layers/load_max_{i:02d}": v for i, v in enumerate(load.amax(dim=1).tolist())},
-                   # per layer, the raw counts as a histogram with one bucket per expert, as Marin's routing_hist (wandb: at most 512 buckets)
-                   **{f"moe_layers/routing_hist_{i:02d}": wandb.Histogram(np_histogram=(c, list(range(len(c) + 1)))) for i, c in enumerate(counts.tolist())}}
+                   # per layer, the raw counts as a histogram with one bucket per expert, as Marin's train/router/layer_{i}/routing_hist
+                   # (a section of its own in wandb; wandb takes at most 512 buckets)
+                   **{f"router/layer_{i:02d}/routing_hist": wandb.Histogram(np_histogram=(c, list(range(len(c) + 1)))) for i, c in enumerate(counts.tolist())}}
         eta_str += f" | expert load: {moe_log['moe/load_min']:.2f}-{moe_log['moe/load_max']:.2f} cv {moe_log['moe/load_cv']:.3f}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     # parameter norms per optimizer group, in fp32 (the embeddings are stored in bf16); the Muon groups share "matrix"
