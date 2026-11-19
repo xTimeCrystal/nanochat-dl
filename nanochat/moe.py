@@ -110,7 +110,7 @@ def _combine(O, Y, X, DOTS, T, D, NP, K: tl.constexpr, DOT: tl.constexpr, BT: tl
     acc = tl.zeros((BT, BD), dtype=tl.float32)
     if DOT:
         x = tl.load(X + rt[:, None] * D + rd[None, :], mask=mask, other=0.0).to(tl.float32)
-    for k in tl.static_range(K):
+    for k in range(K):  # (a real loop: unrolled, 12 or more slots spill the registers and the sum runs 8x slower)
         o = tl.load(O + (rt * K + k)[:, None] * D + rd[None, :], mask=mask, other=0.0).to(tl.float32)
         acc += o
         if DOT:
