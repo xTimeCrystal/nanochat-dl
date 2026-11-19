@@ -22,6 +22,7 @@ import torch.distributed as dist
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
+from nanochat.moe import MoE, Linear
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
@@ -41,26 +42,19 @@ class GPTConfig:
     # Attention Residuals (nanochat/attn_res.py): every attention and MLP reads a softmax-over-depth mixture of the
     # embedding and all earlier sublayer outputs instead of a residual stream (no resid/x0 lambdas, no backout)
     attn_res: bool = False
-    # Mixture of Experts in place of the MLP (nanochat/moe.py): routed experts, of which a token goes through
-    # num_experts_per_token, plus shared experts that every token goes through. 0 routed experts = the dense MLP.
-    # No defaults: with experts, set every field. The two sizes are the hidden widths of one routed and of one shared expert.
+    # The MLP sublayer is a Mixture of Experts (nanochat/moe.py): shared experts that every token goes through plus routed
+    # experts, of which a token goes through num_experts_per_token. The two sizes are the hidden widths of one routed and
+    # of one shared expert. The dense MLP is 1 shared expert 4 * n_embd wide and no routed experts: set it, there is no
+    # default for the width.
     num_experts: int = 0
-    num_experts_per_token: int | None = None
-    moe_intermediate_size: int | None = None
-    num_shared_experts: int | None = None
+    num_experts_per_token: int = 0
+    moe_intermediate_size: int = 0
+    num_shared_experts: int = 1
     shared_intermediate_size: int | None = None
 
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
-
-class Linear(nn.Linear):
-    """nn.Linear that casts weights to match input dtype in forward.
-    Replaces autocast: master weights stay fp32 for optimizer precision,
-    but matmuls run in the activation dtype (typically bf16 from embeddings)."""
-    def forward(self, x):
-        return F.linear(x, self.weight.to(dtype=x.dtype))
-
 
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
@@ -140,33 +134,20 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class MLP(nn.Module):
+class MLP(MoE):
+    """The MLP sublayer: the config's Mixture of Experts (nanochat/moe.py) with relu^2. 1 shared expert 4 * n_embd wide and
+    no routed experts is the dense MLP."""
     def __init__(self, config):
-        super().__init__()
-        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
-
-
-def moe_of(config):
-    """A layer's MoE (nanochat/moe.py) from the config: every field given, no defaults, no derived widths."""
-    from nanochat.moe import MoE # (Triton kernels: imported only with experts)
-    for name in ("num_experts_per_token", "moe_intermediate_size", "num_shared_experts", "shared_intermediate_size"):
-        assert getattr(config, name) is not None, f"MoE: set {name} explicitly (no defaults, no derived widths)"
-    return MoE(config.n_embd, config.num_experts, config.num_experts_per_token, config.moe_intermediate_size,
-               config.num_shared_experts, config.shared_intermediate_size, activation="relu2") # (the dense MLP's)
+        assert config.shared_intermediate_size is not None, "GPTConfig: set shared_intermediate_size (the dense MLP: num_shared_experts=1, shared_intermediate_size=4 * n_embd)"
+        super().__init__(config.n_embd, config.num_experts, config.num_experts_per_token, config.moe_intermediate_size,
+                         config.num_shared_experts, config.shared_intermediate_size, activation="relu2")
 
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = moe_of(config) if config.num_experts else MLP(config)
+        self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -190,16 +171,6 @@ class AttnResMLP(MLP):
         return super().forward(x)
 
 
-class AttnResMoE(nn.Module):
-    """A layer's MoE as an AttnRes block."""
-    def __init__(self, config):
-        super().__init__()
-        self.moe = moe_of(config)
-
-    def forward(self, x, ves, cos_sin, kv_cache):
-        return self.moe(x)
-
-
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -219,8 +190,7 @@ class GPT(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         if config.attn_res: # every sublayer is a block of the backbone, the embedding its input
             from nanochat.attn_res import AttnResBackbone # (Triton kernels: imported only in this mode)
-            mlp = AttnResMoE if config.num_experts else AttnResMLP
-            h = AttnResBackbone(nn.ModuleList([m for i in range(config.n_layer) for m in (AttnResAttention(config, i, self.window_sizes[i]), mlp(config))]),
+            h = AttnResBackbone(nn.ModuleList([m for i in range(config.n_layer) for m in (AttnResAttention(config, i, self.window_sizes[i]), AttnResMLP(config))]),
                                 config.n_embd, starts=range(2 * config.n_layer), norm_input=True, norm_keys=True, norm_output=True)
         else:
             h = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)])
@@ -283,11 +253,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(attn.c_proj.weight) # projections are zero
-            if not self.config.num_experts:
-                torch.nn.init.uniform_(mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-                torch.nn.init.zeros_(mlp.c_proj.weight)
-        for moe in self.moes(): # experts like the MLP, the router like the attention's inputs
-            moe.init_weights()
+            mlp.init_weights() # c_fc uniform at 0.4x the scale, c_proj zero; routed experts alike, their router like c_q
 
         # Per-layer scalars
         n_layer = self.config.n_layer
@@ -414,28 +380,20 @@ class GPT(nn.Module):
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
         """
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
-        matmul_params += sum(m.routed.router.numel() for m in self.moes()) + self.num_active_expert_params() # MoE: what a token goes through
+        if self.config.num_experts > 0: # routed experts are not Linear modules: the router and the k experts a token goes through
+            k, E = self.config.num_experts_per_token, self.config.num_experts
+            matmul_params += sum(mlp.router.numel() + (mlp.wu.numel() + mlp.wd.numel()) * k // E for _, mlp in self.layers())
         return matmul_params
 
-    def moes(self):
-        """The MoE of every layer ([] without experts)."""
-        if not self.config.num_experts:
-            return []
-        return [mlp.moe if self.config.attn_res else mlp for _, mlp in self.layers()]
-
-    def num_active_expert_params(self):
-        # expert parameters a token goes through: the shared experts and k routed ones
-        return sum(m.num_active_params() for m in self.moes())
-
     def pop_moe_stats(self):
-        # every expert's load since the last call relative to an even split, (layers, experts), summed over micro-batches
-        # and ranks (an all-reduce: every rank calls it), then reset
-        moes = self.moes()
-        load = torch.stack([m.routed.load for m in moes])
+        # every routed expert's load since the last call relative to an even split, (layers, experts), summed over
+        # micro-batches and ranks (an all-reduce: every rank calls it), then reset
+        mlps = [mlp for _, mlp in self.layers()]
+        load = torch.stack([mlp.load for mlp in mlps])
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(load)
-        for m in moes:
-            m.routed.load.zero_()
+        for mlp in mlps:
+            mlp.load.zero_()
         return load / load.mean(1, keepdim=True).clamp_min(1)
 
     def estimate_decode_flops(self, context_len):
@@ -496,9 +454,9 @@ class GPT(nn.Module):
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters()) - (self.transformer.h.pseudo_queries.numel() if self.config.attn_res else 0)
         scalars = sum(p.numel() for p in self.scalar_params())
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        # the matrices a token goes through (router aside): for an MoE, the training horizon and hyperparameters follow these
-        expert_params = sum(sum(p.numel() for p in m.parameters()) for m in self.moes())
-        active_matrices = transformer_matrices - expert_params + self.num_active_expert_params()
+        # the matrices a token goes through (routers aside): with routed experts, the training horizon and hyperparameters follow these
+        mlps = [mlp for _, mlp in self.layers()]
+        active_matrices = transformer_matrices - sum(p.numel() for mlp in mlps for p in mlp.parameters()) + sum(mlp.num_active_params() for mlp in mlps)
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -521,7 +479,7 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         attn_res = self.config.attn_res
-        # (an MoE's router is a matrix too: under AdamW its scores saturate)
+        # (a router of routed experts is a matrix too: under AdamW its scores saturate)
         matrix_params = [p for p in self.transformer.h.parameters() if not attn_res or p is not self.transformer.h.pseudo_queries]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())

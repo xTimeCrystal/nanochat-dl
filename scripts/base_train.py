@@ -52,11 +52,11 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--num-experts", type=int, default=0, help="MoE in place of the MLP: routed experts per layer (0 = dense MLP)")
-parser.add_argument("--num-experts-per-token", type=int, default=None, help="MoE: routed experts per token (required with experts)")
-parser.add_argument("--moe-intermediate-size", type=int, default=None, help="MoE: hidden width of one routed expert (required with experts)")
-parser.add_argument("--num-shared-experts", type=int, default=None, help="MoE: shared experts, which every token goes through (required with experts)")
-parser.add_argument("--shared-intermediate-size", type=int, default=None, help="MoE: hidden width of one shared expert (required with experts)")
+parser.add_argument("--num-experts", type=int, default=0, help="MLP sublayer (nanochat/moe.py): routed experts per layer. 0 = the dense MLP: 1 shared expert 4 * model_dim wide")
+parser.add_argument("--num-experts-per-token", type=int, default=None, help="routed experts per token (required with --num-experts)")
+parser.add_argument("--moe-intermediate-size", type=int, default=None, help="hidden width of one routed expert (required with --num-experts)")
+parser.add_argument("--num-shared-experts", type=int, default=None, help="shared experts, which every token goes through (required with --num-experts)")
+parser.add_argument("--shared-intermediate-size", type=int, default=None, help="hidden width of one shared expert (required with --num-experts)")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--attn-res", action="store_true", help="Attention Residuals: every sublayer reads a softmax-over-depth mixture of all earlier outputs instead of a residual stream")
 # Training horizon (only one used, in order of precedence)
@@ -93,6 +93,13 @@ for flag, default, value in [("eval-tokens", parser.get_default("eval_tokens"), 
                              ("core-metric-max-per-task", parser.get_default("core_metric_max_per_task"), args.core_metric_max_per_task)]:
     if value != -1 and value < default:
         raise ValueError(f"--{flag}={value} is below the default {default}: this INVALIDATES THE RUN (its evals are not comparable)")
+# Routed experts come with their whole layer spelled out: no defaults, no derived widths.
+moe_flags = {name: getattr(args, name.replace("-", "_")) for name in ("num-experts-per-token", "moe-intermediate-size", "num-shared-experts", "shared-intermediate-size")}
+unset = [f"--{name}" for name, value in moe_flags.items() if value is None]
+if args.num_experts > 0 and unset:
+    raise ValueError(f"with --num-experts, also set {', '.join(unset)}")
+if args.num_experts == 0 and len(unset) < len(moe_flags):
+    raise ValueError("--num-experts-per-token, --moe-intermediate-size, --num-shared-experts and --shared-intermediate-size describe a layer with routed experts: set --num-experts too")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -142,19 +149,22 @@ print0(f"Vocab size: {vocab_size:,}")
 # Initialize the Model
 
 def build_model_meta(depth, dense=False):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data). dense: without the MoE, for the
-    reference model the hyperparameter scalings are relative to."""
+    """Build a model on meta device for a given depth (shapes/dtypes only, no data). dense: with the dense MLP whatever
+    the flags say, for the reference model the hyperparameter scalings are relative to."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    if dense or args.num_experts == 0: # the dense MLP: 1 shared expert 4 * model_dim wide, no routed experts
+        mlp = dict(num_experts=0, num_experts_per_token=0, moe_intermediate_size=0, num_shared_experts=1, shared_intermediate_size=4 * model_dim)
+    else: # every field as given: no defaults, no derived widths
+        mlp = dict(num_experts=args.num_experts, num_experts_per_token=args.num_experts_per_token, moe_intermediate_size=args.moe_intermediate_size,
+                   num_shared_experts=args.num_shared_experts, shared_intermediate_size=args.shared_intermediate_size)
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern, attn_res=args.attn_res,
-        num_experts=0 if dense else args.num_experts, num_experts_per_token=args.num_experts_per_token,
-        moe_intermediate_size=args.moe_intermediate_size, num_shared_experts=args.num_shared_experts, shared_intermediate_size=args.shared_intermediate_size,
+        window_pattern=args.window_pattern, attn_res=args.attn_res, **mlp,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -585,7 +595,7 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     moe_log = {}
-    if orig_model.moes(): # tokens per expert relative to an even split, over this step's micro-batches and ranks
+    if orig_model.config.num_experts > 0: # tokens per routed expert relative to an even split, over this step's micro-batches and ranks
         load = orig_model.pop_moe_stats() # (layers, experts)
         stats = torch.cat([torch.stack([load.min(), load.max(), load.std(dim=1).mean()]), load.amax(dim=1)]).tolist() # one sync
         moe_log = {"moe/load_min": stats[0], "moe/load_max": stats[1], "moe/load_cv": stats[2],
