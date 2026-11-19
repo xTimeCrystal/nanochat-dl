@@ -258,18 +258,20 @@ def routed_experts(x, fc, proj, sel, p, activation):
 # Quantile Balancing (Kimi K3 tech report, 2.3.3): after each batch, per expert, the bias that would have given it exactly
 # k/E of the tokens with every token's cutoff held fixed, read off a histogram of the routing margins (score + bias - the
 # token's cutoff). Histograms add, so DDP all-reduces them. A token's cutoff may lie anywhere between its k-th and (k+1)-th
-# largest biased scores; the report takes the (k+1)-th, routed (below) their midpoint.
-BINS, SPAN = 512, 0.5
+# largest biased scores; the report takes the (k+1)-th, routed (below) their midpoint. The histogram covers every margin
+# there can be, as the report's does: +-span, span = 1 + the range of the biases, as a score is in (0, 1) and a cutoff lies
+# between two biased scores. (A fixed window caps a step at its half-width: an expert left without tokens recovers slowly.)
+BINS = 512
 
 
-def margin_counts(s, cutoff, bias):
+def margin_counts(s, cutoff, bias, span):
     T, E = s.shape
-    idx = (((s + bias) - cutoff[:, None] + SPAN) * (BINS / (2 * SPAN))).long().clamp_(0, BINS - 1)
+    idx = (((s + bias) - cutoff[:, None] + span) * (BINS / (2 * span))).long().clamp_(0, BINS - 1)
     return torch.zeros(E, BINS, device=s.device).scatter_add_(1, idx.t(), torch.ones(E, T, device=s.device))
 
 
 @torch.library.custom_op("moe::quantile_balance", mutates_args=())
-def quantile_balance(counts: Tensor, bias: Tensor, k: int) -> Tensor:
+def quantile_balance(counts: Tensor, bias: Tensor, span: Tensor, k: int) -> Tensor:
     E = counts.shape[0]
     if dist.is_available() and dist.is_initialized():
         counts = counts.clone()
@@ -279,12 +281,12 @@ def quantile_balance(counts: Tensor, bias: Tensor, k: int) -> Tensor:
     i = (above < target).sum(1, keepdim=True).clamp_(max=BINS - 1)  # the bin where the target is crossed
     below = above.gather(1, (i - 1).clamp_(min=0)) * (i > 0)
     frac = ((target - below) / (above.gather(1, i) - below).clamp_(min=1)).clamp_(0, 1)
-    bias = bias - (SPAN - (i + frac).squeeze(1) * (2 * SPAN / BINS))
+    bias = bias - span * (1 - (i + frac).squeeze(1) * (2 / BINS))
     return bias - bias.mean()
 
 
 @quantile_balance.register_fake
-def _(counts, bias, k):
+def _(counts, bias, span, k):
     return torch.empty_like(bias)
 
 
@@ -301,10 +303,12 @@ def routed(mlp, x):
     if mlp.training:  # balance for the next batch on this one's margins
         mlp.load.scatter_add_(0, sel.reshape(-1), torch.ones(sel.numel(), device=sel.device))
         # The cutoff: midway between the token's k-th and (k+1)-th largest biased scores (the k-th alone when every
-        # expert is selected). With few experts per token the two are far apart, and at the (k+1)-th an expert the
-        # token did not select looks closer to getting in than it is: loads then stay 10-30 % off an even split,
-        # against a few % at the midpoint.
+        # expert is selected). What an expert has to beat is the k-th largest biased score of the others: the token's
+        # (k+1)-th if it selects the expert, its k-th if not. The midpoint is half the gap off for both, which about
+        # halves every step. The exact cutoff overshoots, as all biases move at once (2 experts would swap loads
+        # forever); the report's (k+1)-th leaves loads 10-30 % off an even split with 2 experts per token.
         cutoff = top.values[:, k - 1:].mean(1)
-        mlp.bias.copy_(quantile_balance(margin_counts(s.detach(), cutoff.detach(), mlp.bias), mlp.bias, k))
+        span = 1 + mlp.bias.max() - mlp.bias.min()
+        mlp.bias.copy_(quantile_balance(margin_counts(s.detach(), cutoff.detach(), mlp.bias, span), mlp.bias, span, k))
     g = s.gather(1, sel)
     return routed_experts(x, mlp.e_fc, mlp.e_proj, sel, g / g.sum(1, keepdim=True), mlp.activation).view(shape)
