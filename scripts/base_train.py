@@ -154,7 +154,7 @@ def build_model_meta(depth, dense=False):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
-    mlp = dict(num_shared_experts=1, shared_intermediate_size=4 * model_dim) # the dense MLP
+    mlp = {} # the dense MLP (GPTConfig's default)
     if args.num_experts > 0 and not dense: # every size as given: no defaults
         mlp = dict(num_shared_experts=args.num_shared_experts, shared_intermediate_size=args.shared_intermediate_size,
                    num_experts=args.num_experts, num_experts_per_token=args.num_experts_per_token, moe_intermediate_size=args.moe_intermediate_size)
@@ -543,6 +543,7 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        orig_model.balance_routers() # Quantile Balancing on this micro-batch's routing (no-op for the dense MLP)
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -600,8 +601,9 @@ while True:
         # per layer, named as Marin's train/router/layer_{i}/...: the idlest and the busiest expert, and the raw counts as a
         # histogram with one bucket per expert (wandb takes at most 512 buckets)
         for i, (c, l) in enumerate(zip(counts.tolist(), load.tolist())):
-            moe_log |= {f"router/layer_{i}/load_min": min(l), f"router/layer_{i}/load_max": max(l),
-                        f"router/layer_{i}/routing_hist": wandb.Histogram(np_histogram=(c, list(range(len(c) + 1))))}
+            moe_log |= {f"router/layer_{i}/load_min": min(l), f"router/layer_{i}/load_max": max(l)}
+            if len(c) <= 512:
+                moe_log[f"router/layer_{i}/routing_hist"] = wandb.Histogram(np_histogram=(c, list(range(len(c) + 1))))
         eta_str += f" | expert load: {moe_log['router/load_min']:.2f}-{moe_log['router/load_max']:.2f} cv {moe_log['router/load_cv']:.3f}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     # parameter norms per optimizer group, in fp32 (the embeddings are stored in bf16); the Muon groups share "matrix"
