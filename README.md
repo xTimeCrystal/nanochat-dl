@@ -37,6 +37,14 @@ uv sync --extra cpu    # (or) Use for CPU-only / MPS
 source .venv/bin/activate
 ```
 
+On a machine that already has PyTorch (>= 2.9.1, e.g. a rented GPU node's preinstalled environment), reuse it instead of
+downloading another one:
+
+```bash
+uv venv --system-site-packages && uv pip install -e .
+source .venv/bin/activate
+```
+
 For development (adds pytest, matplotlib, ipykernel, transformers, etc.):
 
 ```bash
