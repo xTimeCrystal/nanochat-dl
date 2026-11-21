@@ -299,6 +299,7 @@ for step in range(num_steps):
         group["lr"] = group["initial_lr"] * lrm
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    model.balance_routers() # Quantile Balancing once per step: the rollouts and their loss passes all route with one bias
     wandb_run.log({
         "step": step,
         "lrm": lrm,

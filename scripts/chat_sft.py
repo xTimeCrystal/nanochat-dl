@@ -430,6 +430,7 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        orig_model.balance_routers() # Quantile Balancing on this micro-batch's routing (no-op for the dense MLP)
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
