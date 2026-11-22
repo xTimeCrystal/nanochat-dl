@@ -41,10 +41,9 @@ class GPTConfig:
     # Attention Residuals (nanochat/attn_res.py): every attention and MLP reads a softmax-over-depth mixture of the
     # embedding and all earlier sublayer outputs instead of a residual stream (no resid/x0 lambdas, no backout)
     attn_res: bool = False
-    # The MLP is a Mixture of Experts (Kimi K3 style): shared experts, which every token goes through, plus routed experts
-    # (nanochat/moe.py), of which a token goes through num_experts_per_token. The sizes are one expert's hidden width.
-    # The dense MLP is 1 shared expert 4 * n_embd wide.
-    num_shared_experts: int = 0
+    # The MLP is a Mixture of Experts (Kimi K3 style): a shared part, which every token goes through, plus routed experts
+    # (nanochat/moe.py), of which a token goes through num_experts_per_token. shared_intermediate_size is the shared part's
+    # whole hidden width (0 = none), moe_intermediate_size one routed expert's. The dense MLP: shared 4 * n_embd, no experts.
     shared_intermediate_size: int = 0
     num_experts: int = 0
     num_experts_per_token: int = 0
@@ -151,8 +150,8 @@ class MLP(nn.Module):
         self.num_experts_per_token = config.num_experts_per_token
         self.activation = config.activation
         assert self.activation in ("relu2", "silu")
-        hidden = config.num_shared_experts * config.shared_intermediate_size
-        assert hidden > 0 or self.num_experts > 0 # (the dense MLP: num_shared_experts=1, shared_intermediate_size=4 * n_embd)
+        hidden = config.shared_intermediate_size
+        assert hidden > 0 or self.num_experts > 0 # (the dense MLP: shared_intermediate_size=4 * n_embd)
         self.c_fc = Linear(config.n_embd, hidden, bias=False)
         self.c_proj = Linear(hidden, config.n_embd, bias=False)
         if self.num_experts > 0: # routed experts: a router, and stacks (num_experts, out, in) of their c_fc and c_proj

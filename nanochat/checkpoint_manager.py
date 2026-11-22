@@ -25,10 +25,13 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
-    # Old models have the dense MLP: 1 shared expert 4 * n_embd wide
-    if "num_shared_experts" not in model_config_kwargs:
-        model_config_kwargs.update(num_shared_experts=1, shared_intermediate_size=4 * model_config_kwargs["n_embd"])
-        log0(f"Patching missing num_shared_experts, shared_intermediate_size in model config to 1, 4 * n_embd")
+    # Old models have the dense MLP: a shared part 4 * n_embd wide
+    if "shared_intermediate_size" not in model_config_kwargs:
+        model_config_kwargs["shared_intermediate_size"] = 4 * model_config_kwargs["n_embd"]
+        log0(f"Patching missing shared_intermediate_size in model config to 4 * n_embd")
+    # MoE checkpoints from before the shared width was one number: num_shared_experts x shared_intermediate_size
+    if "num_shared_experts" in model_config_kwargs:
+        model_config_kwargs["shared_intermediate_size"] *= model_config_kwargs.pop("num_shared_experts")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
