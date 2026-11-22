@@ -159,10 +159,10 @@ def build_model_meta(depth, dense=False):
         mlp = dict(num_shared_experts=args.num_shared_experts, shared_intermediate_size=args.shared_intermediate_size,
                    num_experts=args.num_experts, num_experts_per_token=args.num_experts_per_token, moe_intermediate_size=args.moe_intermediate_size)
         assert None not in mlp.values(), "--num-experts needs --num-experts-per-token, --moe-intermediate-size, --num-shared-experts, --shared-intermediate-size"
-        # the MoE sweep's shape (22 Nov 2026): shared width D, routed experts D/4 wide (optimum at fixed total params, d6-d12)
+        # the MoE sweep's shape (22 Nov 2026): shared width 2D, routed experts D/4 wide (optimum at fixed total params, d6-d12)
         shared = args.num_shared_experts * args.shared_intermediate_size
-        assert shared == model_dim and args.moe_intermediate_size == model_dim // 4, (
-            f"MoE shape: the shared width must be D = {model_dim} (got {args.num_shared_experts} x {args.shared_intermediate_size} = {shared}) "
+        assert shared == 2 * model_dim and args.moe_intermediate_size == model_dim // 4, (
+            f"MoE shape: the shared width must be 2D = {2 * model_dim} (got {args.num_shared_experts} x {args.shared_intermediate_size} = {shared}) "
             f"and --moe-intermediate-size D/4 = {model_dim // 4} (got {args.moe_intermediate_size})")
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
