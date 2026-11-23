@@ -259,8 +259,8 @@ def routed_experts(x, fc, proj, sel, p, activation):
 
 # Quantile Balancing (Kimi K3 tech report, 2.3.3): per expert, the bias that would have given it exactly k/E of the tokens
 # with every token's cutoff held fixed, read off a histogram of the routing margins (score + bias - the token's cutoff).
-# Training forwards add their margins to mlp.margins; GPT.balance_routers sets the biases from them (base_train: after
-# every micro-batch) and resets them. Histograms add, so DDP all-reduces them, all layers at once. A token's cutoff may
+# Training forwards add their margins to mlp.margins; the layer's balance() sets its bias from them (base_train: after
+# every micro-batch) and resets them. Histograms add, so DDP all-reduces them. A token's cutoff may
 # lie anywhere between its k-th and (k+1)-th largest biased scores; the report takes the (k+1)-th, routed (below) their
 # midpoint. The histogram covers every margin there can be, as the report's does: +-span, span = 1 + the range of the
 # biases, as a score is in (0, 1) and a cutoff lies between two biased scores. (A fixed window caps a step at its
@@ -275,21 +275,20 @@ def margin_counts(s, cutoff, bias, span):
 
 
 @torch.no_grad()
-def quantile_balance(mlps):
-    all_counts = torch.stack([mlp.margins for mlp in mlps])
+def quantile_balance(counts, bias, k):
+    # The bias from a layer's margin histogram counts (E, BINS), recorded under this bias
+    E = counts.shape[0]
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(all_counts)
-    for mlp, counts in zip(mlps, all_counts):
-        E, k, bias = counts.shape[0], mlp.num_experts_per_token, mlp.bias
-        span = 1 + bias.max() - bias.min()  # (the forwards' span: the bias has not changed since)
-        above = counts.flip(1).cumsum(1)  # margins in each expert's top i + 1 bins
-        target = counts.sum(1, keepdim=True) * k / E
-        i = (above < target).sum(1, keepdim=True).clamp_(max=BINS - 1)  # the bin where the target is crossed
-        below = above.gather(1, (i - 1).clamp_(min=0)) * (i > 0)
-        frac = ((target - below) / (above.gather(1, i) - below).clamp_(min=1)).clamp_(0, 1)
-        bias = bias - span * (1 - (i + frac).squeeze(1) * (2 / BINS))
-        mlp.bias.copy_(bias - bias.mean())
-        mlp.margins.zero_()
+        counts = counts.clone()
+        dist.all_reduce(counts)
+    span = 1 + bias.max() - bias.min()  # (the forwards' span: the bias has not changed since)
+    above = counts.flip(1).cumsum(1)  # margins in each expert's top i + 1 bins
+    target = counts.sum(1, keepdim=True) * k / E
+    i = (above < target).sum(1, keepdim=True).clamp_(max=BINS - 1)  # the bin where the target is crossed
+    below = above.gather(1, (i - 1).clamp_(min=0)) * (i > 0)
+    frac = ((target - below) / (above.gather(1, i) - below).clamp_(min=1)).clamp_(0, 1)
+    bias = bias - span * (1 - (i + frac).squeeze(1) * (2 / BINS))
+    return bias - bias.mean()
 
 
 def routed(mlp, x):

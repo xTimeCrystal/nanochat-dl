@@ -176,6 +176,14 @@ class MLP(nn.Module):
             y = y + routed(self, x)
         return y
 
+    def balance(self):
+        # Quantile Balancing: this layer's routing bias from the margins its training forwards recorded since the last
+        # call (an all-reduce: every rank calls it). The bias stays fixed between calls. The dense MLP has none.
+        if self.num_experts > 0:
+            from nanochat.moe import quantile_balance
+            self.bias.copy_(quantile_balance(self.margins, self.bias, self.num_experts_per_token))
+            self.margins.zero_()
+
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
@@ -438,11 +446,9 @@ class GPT(nn.Module):
         return counts
 
     def balance_routers(self):
-        # Quantile Balancing: set every layer's routing bias from the margins its training forwards recorded since the
-        # last call (one all-reduce for all layers: every rank calls it). The bias stays fixed between calls.
-        if self.config.num_experts > 0:
-            from nanochat.moe import quantile_balance
-            quantile_balance([mlp for _, mlp in self.layers()])
+        # Quantile Balancing of every layer (MLP.balance): after a micro-batch's forward, on every rank
+        for _, mlp in self.layers():
+            mlp.balance()
 
     def estimate_decode_flops(self, context_len):
         """
