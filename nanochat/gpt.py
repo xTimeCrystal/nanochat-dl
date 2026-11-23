@@ -44,7 +44,7 @@ class GPTConfig:
     # The MLP is a Mixture of Experts (Kimi K3 style): a shared part, which every token goes through, plus routed experts
     # (nanochat/moe.py), of which a token goes through num_experts_per_token. shared_intermediate_size is the shared part's
     # whole hidden width (0 = none), moe_intermediate_size one routed expert's. The dense MLP: shared 4 * n_embd, no experts.
-    shared_intermediate_size: int = 0
+    shared_intermediate_size: int = 3072 # (the dense MLP at the default n_embd; set it together with n_embd)
     num_experts: int = 0
     num_experts_per_token: int = 0
     moe_intermediate_size: int = 0
@@ -156,12 +156,16 @@ class MLP(nn.Module):
         self.c_proj = Linear(hidden, config.n_embd, bias=False)
         if self.num_experts > 0: # routed experts: a router, and stacks (num_experts, out, in) of their c_fc and c_proj
             assert 0 < self.num_experts_per_token <= self.num_experts and config.moe_intermediate_size > 0
+            # (top-1 of several experts: p = s / s = 1, so the router would get no gradient)
+            assert self.num_experts_per_token > 1 or self.num_experts == 1
             assert config.n_embd % 16 == 0 and config.moe_intermediate_size % 16 == 0 # (else the kernels run at half speed)
             self.router = Linear(config.n_embd, self.num_experts, bias=False)
             self.e_fc = nn.Parameter(torch.empty(self.num_experts, config.moe_intermediate_size, config.n_embd))
             self.e_proj = nn.Parameter(torch.empty(self.num_experts, config.n_embd, config.moe_intermediate_size))
             self.register_buffer("bias", torch.zeros(self.num_experts)) # selection bias, set by Quantile Balancing
             self.register_buffer("load", torch.zeros(self.num_experts), persistent=False) # selections per expert since they were last read
+            from nanochat.moe import BINS # (Triton kernels: imported only in this mode)
+            self.register_buffer("margins", torch.zeros(self.num_experts, BINS), persistent=False) # routing margins since the last balance
 
     def forward(self, x):
         y = self.c_fc(x)
@@ -291,6 +295,7 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(mlp.e_proj)
                 torch.nn.init.zeros_(mlp.bias)
                 torch.nn.init.zeros_(mlp.load)
+                torch.nn.init.zeros_(mlp.margins)
 
         # Per-layer scalars
         n_layer = self.config.n_layer
@@ -432,6 +437,13 @@ class GPT(nn.Module):
             mlp.load.zero_()
         return counts
 
+    def balance_routers(self):
+        # Quantile Balancing: set every layer's routing bias from the margins its training forwards recorded since the
+        # last call (one all-reduce for all layers: every rank calls it). The bias stays fixed between calls.
+        if self.config.num_experts > 0:
+            from nanochat.moe import quantile_balance
+            quantile_balance([mlp for _, mlp in self.layers()])
+
     def estimate_decode_flops(self, context_len):
         """
         Forward FLOPs to decode one token at a given context length during inference:
@@ -535,15 +547,15 @@ class GPT(nn.Module):
             dict(kind='adamw', name='lm_head', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', name='embedding', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', name='value_embeds', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
-            dict(kind='adamw', name='smear', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        if attn_res: # pseudo-queries: Adam at attn_res_lr as given (no dmodel scaling), no weight decay
-            param_groups.append(dict(kind='adamw', name='attn_res', params=attn_res_params, lr=attn_res_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
-        else:
+        if not attn_res: # (the dense groups in their original order: optimizer checkpoints load by group position)
             param_groups += [
                 dict(kind='adamw', name='resid', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
                 dict(kind='adamw', name='x0', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             ]
+        param_groups.append(dict(kind='adamw', name='smear', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+        if attn_res: # pseudo-queries: Adam at attn_res_lr as given (no dmodel scaling), no weight decay
+            param_groups.append(dict(kind='adamw', name='attn_res', params=attn_res_params, lr=attn_res_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking; an expert stack (E, out, in) is E matrices)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]

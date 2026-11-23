@@ -158,7 +158,8 @@ def build_model_meta(depth, dense=False):
         mlp = dict(shared_intermediate_size=args.shared_intermediate_size, num_experts=args.num_experts,
                    num_experts_per_token=args.num_experts_per_token, moe_intermediate_size=args.moe_intermediate_size)
         assert None not in mlp.values(), "--num-experts needs --num-experts-per-token, --moe-intermediate-size, --shared-intermediate-size"
-        # the MoE sweep's shape (22 Nov 2026): shared width 2D, routed experts D/4 wide (optimum at fixed total params, d6-d12)
+        # the MoE sweep's shape (Nov 2026, d4-d16): shared width 2D, routed experts D/4 wide (at fixed total params the best
+        # routed width is D/3.4, pooled; a shared width of 0 to 2D is within run noise, 3D is worse)
         assert args.shared_intermediate_size == 2 * model_dim and args.moe_intermediate_size == model_dim // 4, (
             f"MoE shape: --shared-intermediate-size must be 2D = {2 * model_dim} (got {args.shared_intermediate_size}) "
             f"and --moe-intermediate-size D/4 = {model_dim // 4} (got {args.moe_intermediate_size})")
@@ -546,6 +547,7 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        orig_model.balance_routers() # Quantile Balancing on this micro-batch's routing (no-op for the dense MLP)
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -603,8 +605,9 @@ while True:
         # per layer, named as Marin's train/router/layer_{i}/...: the idlest and the busiest expert, and the raw counts as a
         # histogram with one bucket per expert (wandb takes at most 512 buckets)
         for i, (c, l) in enumerate(zip(counts.tolist(), load.tolist())):
-            moe_log |= {f"router/layer_{i}/load_min": min(l), f"router/layer_{i}/load_max": max(l),
-                        f"router/layer_{i}/routing_hist": wandb.Histogram(np_histogram=(c, list(range(len(c) + 1))))}
+            moe_log |= {f"router/layer_{i}/load_min": min(l), f"router/layer_{i}/load_max": max(l)}
+            if len(c) <= 512:
+                moe_log[f"router/layer_{i}/routing_hist"] = wandb.Histogram(np_histogram=(c, list(range(len(c) + 1))))
         eta_str += f" | expert load: {moe_log['router/load_min']:.2f}-{moe_log['router/load_max']:.2f} cv {moe_log['router/load_cv']:.3f}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     # parameter norms per optimizer group, in fp32 (the embeddings are stored in bf16); the Muon groups share "matrix"
