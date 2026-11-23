@@ -159,7 +159,7 @@ def build_model_meta(depth, dense=False):
                    num_experts_per_token=args.num_experts_per_token, moe_intermediate_size=args.moe_intermediate_size)
         assert None not in mlp.values(), "--num-experts needs --num-experts-per-token, --moe-intermediate-size, --shared-intermediate-size"
         # the MoE sweep's shape (Nov 2026, d4-d16): shared width 2D, routed experts D/4 wide (at fixed total params the best
-        # routed width is D/3.4, pooled; a shared width of 0 to 2D is within run noise, 3D is worse)
+        # routed width is D/3.3, pooled; a shared width of 0 to 2D is within run noise, 3D is worse)
         assert args.shared_intermediate_size == 2 * model_dim and args.moe_intermediate_size == model_dim // 4, (
             f"MoE shape: --shared-intermediate-size must be 2D = {2 * model_dim} (got {args.shared_intermediate_size}) "
             f"and --moe-intermediate-size D/4 = {model_dim // 4} (got {args.moe_intermediate_size})")
