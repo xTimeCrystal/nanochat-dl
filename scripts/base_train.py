@@ -58,6 +58,7 @@ parser.add_argument("--moe-intermediate-size", type=int, default=None, help="hid
 parser.add_argument("--shared-intermediate-size", type=int, default=None, help="hidden width of the shared part, which every token goes through")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--attn-res", action="store_true", help="Attention Residuals: every sublayer reads a softmax-over-depth mixture of all earlier outputs instead of a residual stream")
+parser.add_argument("--value-embeds", action="store_true", help="value embeddings (ResFormer): a gated token embedding added to the values of alternating layers")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -166,7 +167,7 @@ def build_model_meta(depth, dense=False):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern, attn_res=args.attn_res, **mlp,
+        window_pattern=args.window_pattern, value_embeds=args.value_embeds, attn_res=args.attn_res, **mlp,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

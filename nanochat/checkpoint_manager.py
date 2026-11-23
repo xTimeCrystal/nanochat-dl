@@ -25,6 +25,10 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Old models have value embeddings (they were always on)
+    if "value_embeds" not in model_config_kwargs:
+        model_config_kwargs["value_embeds"] = True
+        log0(f"Patching missing value_embeds in model config to True")
     # Old models have the dense MLP: a shared part 4 * n_embd wide
     if "shared_intermediate_size" not in model_config_kwargs:
         model_config_kwargs["shared_intermediate_size"] = 4 * model_config_kwargs["n_embd"]
