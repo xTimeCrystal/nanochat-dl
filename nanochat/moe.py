@@ -202,7 +202,9 @@ def _experts_backward(dy: Tensor, x: Tensor, p: Tensor, a: Tensor, z: Tensor, fc
     # Two pairs that do not depend on each other, one per stream: with few rows a launch's last wave of tiles is part
     # empty, and the other stream's kernel fills it. Side stream: dproj, then dfc once dz is there.
     main = torch.cuda.current_stream()
-    side = _SIDE.setdefault(x.device, torch.cuda.Stream(x.device)) if OVERLAP else main
+    if OVERLAP and x.device not in _SIDE:
+        _SIDE[x.device] = torch.cuda.Stream(x.device)
+    side = _SIDE[x.device] if OVERLAP else main
     side.wait_stream(main)
     with torch.cuda.stream(side):
         _weight_grad(dy, a, dproj, plan, lgather=True)  # dy^T a
@@ -216,7 +218,7 @@ def _experts_backward(dy: Tensor, x: Tensor, p: Tensor, a: Tensor, z: Tensor, fc
         return _sum_slots(dxs, T, K), dfc, dproj, dots.sum(1).view(T, K)
     # relu^2: a is of degree 2 in z, so dL/dp = <da, a> / p = <dz @ fc, x> / (2 p): the slot's dx dotted with x, in the slot sum
     dx, dots = _sum_slots(dxs, T, K, x)
-    return dx, dfc, dproj, dots / (2 * p)
+    return dx, dfc, dproj, torch.where(p > 0, dots / (2 * p), 0.0)  # (p = 0: an underflowed score, which has no gradient)
 
 
 @_experts.register_fake
@@ -255,12 +257,14 @@ def routed_experts(x, fc, proj, sel, p, activation):
     return _experts(x, fc, proj, sel, p, activation == "silu")[0]
 
 
-# Quantile Balancing (Kimi K3 tech report, 2.3.3): after each batch, per expert, the bias that would have given it exactly
-# k/E of the tokens with every token's cutoff held fixed, read off a histogram of the routing margins (score + bias - the
-# token's cutoff). Histograms add, so DDP all-reduces them. A token's cutoff may lie anywhere between its k-th and (k+1)-th
-# largest biased scores; the report takes the (k+1)-th, routed (below) their midpoint. The histogram covers every margin
-# there can be, as the report's does: +-span, span = 1 + the range of the biases, as a score is in (0, 1) and a cutoff lies
-# between two biased scores. (A fixed window caps a step at its half-width: an expert left without tokens recovers slowly.)
+# Quantile Balancing (Kimi K3 tech report, 2.3.3): per expert, the bias that would have given it exactly k/E of the tokens
+# with every token's cutoff held fixed, read off a histogram of the routing margins (score + bias - the token's cutoff).
+# Training forwards add their margins to mlp.margins; the layer's balance() sets its bias from them (base_train: after
+# every micro-batch) and resets them. Histograms add, so DDP all-reduces them. A token's cutoff may
+# lie anywhere between its k-th and (k+1)-th largest biased scores; the report takes the (k+1)-th, routed (below) their
+# midpoint. The histogram covers every margin there can be, as the report's does: +-span, span = 1 + the range of the
+# biases, as a score is in (0, 1) and a cutoff lies between two biased scores. (A fixed window caps a step at its
+# half-width: an expert left without tokens recovers slowly.)
 BINS = 1024  # (the report: 1000. With 512, the first layers of a trained d16 balance worse within a micro-batch)
 
 
@@ -270,12 +274,14 @@ def margin_counts(s, cutoff, bias, span):
     return torch.zeros(E, BINS, device=s.device).scatter_add_(1, idx.t(), torch.ones(E, T, device=s.device))
 
 
-@torch.library.custom_op("moe::quantile_balance", mutates_args=())
-def quantile_balance(counts: Tensor, bias: Tensor, span: Tensor, k: int) -> Tensor:
+@torch.no_grad()
+def quantile_balance(counts, bias, k):
+    # The bias from a layer's margin histogram counts (E, BINS), recorded under this bias
     E = counts.shape[0]
     if dist.is_available() and dist.is_initialized():
         counts = counts.clone()
         dist.all_reduce(counts)
+    span = 1 + bias.max() - bias.min()  # (the forwards' span: the bias has not changed since)
     above = counts.flip(1).cumsum(1)  # margins in each expert's top i + 1 bins
     target = counts.sum(1, keepdim=True) * k / E
     i = (above < target).sum(1, keepdim=True).clamp_(max=BINS - 1)  # the bin where the target is crossed
@@ -285,22 +291,17 @@ def quantile_balance(counts: Tensor, bias: Tensor, span: Tensor, k: int) -> Tens
     return bias - bias.mean()
 
 
-@quantile_balance.register_fake
-def _(counts, bias, span, k):
-    return torch.empty_like(bias)
-
-
 def routed(mlp, x):
     # The routed experts of gpt.py's MLP: sum_k p_k expert_k(x) over each token's k = num_experts_per_token experts with the
     # largest s + bias, where s = sigmoid(router(x)) and p = s / (the sum of the k). The bias only steers the selection;
-    # Quantile Balancing sets it in training. Every (token, expert) pair is computed: nothing is dropped.
+    # Quantile Balancing sets it between forwards. Every (token, expert) pair is computed: nothing is dropped.
     assert x.is_cuda and x.dtype == torch.bfloat16, "the routed experts' kernels take bfloat16 on CUDA"
     k, shape = mlp.num_experts_per_token, x.shape
     x = x.reshape(-1, shape[-1])
     s = torch.sigmoid(mlp.router(x).float())
     top = (s + mlp.bias).topk(min(k + 1, s.shape[1]), dim=1)  # the k selected and, if there is one, the next
     sel = top.indices[:, :k]
-    if mlp.training:  # balance for the next batch on this one's margins
+    if mlp.training:  # record the loads and the margins Quantile Balancing will use
         mlp.load.scatter_add_(0, sel.reshape(-1), torch.ones(sel.numel(), device=sel.device))
         # The cutoff: midway between the token's k-th and (k+1)-th largest biased scores (the k-th alone when every
         # expert is selected). What an expert has to beat is the k-th largest biased score of the others: the token's
@@ -309,6 +310,6 @@ def routed(mlp, x):
         # forever); the report's (k+1)-th leaves loads 10-30 % off an even split with 2 experts per token.
         cutoff = top.values[:, k - 1:].mean(1)
         span = 1 + mlp.bias.max() - mlp.bias.min()
-        mlp.bias.copy_(quantile_balance(margin_counts(s.detach(), cutoff.detach(), mlp.bias, span), mlp.bias, span, k))
+        mlp.margins.add_(margin_counts(s.detach(), cutoff.detach(), mlp.bias, span))
     g = s.gather(1, sel)
     return routed_experts(x, mlp.e_fc, mlp.e_proj, sel, g / g.sum(1, keepdim=True), mlp.activation).view(shape)

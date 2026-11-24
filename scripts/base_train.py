@@ -52,13 +52,13 @@ parser.add_argument("--depth", type=int, default=20, help="depth of the Transfor
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--num-experts", type=int, default=0, help="routed experts per MLP (0 = the dense MLP); with it, set the four below")
+parser.add_argument("--num-experts", type=int, default=0, help="routed experts per MLP (0 = the dense MLP); with it, set the three below")
 parser.add_argument("--num-experts-per-token", type=int, default=None, help="routed experts a token goes through")
 parser.add_argument("--moe-intermediate-size", type=int, default=None, help="hidden width of one routed expert")
-parser.add_argument("--num-shared-experts", type=int, default=None, help="shared experts, which every token goes through")
-parser.add_argument("--shared-intermediate-size", type=int, default=None, help="hidden width of one shared expert")
+parser.add_argument("--shared-intermediate-size", type=int, default=None, help="hidden width of the shared part, which every token goes through")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--attn-res", action="store_true", help="Attention Residuals: every sublayer reads a softmax-over-depth mixture of all earlier outputs instead of a residual stream")
+parser.add_argument("--value-embeds", action="store_true", help="value embeddings (ResFormer): a gated token embedding added to the values of alternating layers")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -154,15 +154,20 @@ def build_model_meta(depth, dense=False):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
-    mlp = dict(num_shared_experts=1, shared_intermediate_size=4 * model_dim) # the dense MLP
+    mlp = dict(shared_intermediate_size=4 * model_dim) # the dense MLP
     if args.num_experts > 0 and not dense: # every size as given: no defaults
-        mlp = dict(num_shared_experts=args.num_shared_experts, shared_intermediate_size=args.shared_intermediate_size,
-                   num_experts=args.num_experts, num_experts_per_token=args.num_experts_per_token, moe_intermediate_size=args.moe_intermediate_size)
-        assert None not in mlp.values(), "--num-experts needs --num-experts-per-token, --moe-intermediate-size, --num-shared-experts, --shared-intermediate-size"
+        mlp = dict(shared_intermediate_size=args.shared_intermediate_size, num_experts=args.num_experts,
+                   num_experts_per_token=args.num_experts_per_token, moe_intermediate_size=args.moe_intermediate_size)
+        assert None not in mlp.values(), "--num-experts needs --num-experts-per-token, --moe-intermediate-size, --shared-intermediate-size"
+        # the MoE sweep's shape (Nov 2026, d4-d16): shared width 2D, routed experts D/4 wide (at fixed total params the best
+        # routed width is D/3.3, pooled; a shared width of 0 to 2D is within run noise, 3D is worse)
+        assert args.shared_intermediate_size == 2 * model_dim and args.moe_intermediate_size == model_dim // 4, (
+            f"MoE shape: --shared-intermediate-size must be 2D = {2 * model_dim} (got {args.shared_intermediate_size}) "
+            f"and --moe-intermediate-size D/4 = {model_dim // 4} (got {args.moe_intermediate_size})")
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern, attn_res=args.attn_res, **mlp,
+        window_pattern=args.window_pattern, value_embeds=args.value_embeds, attn_res=args.attn_res, **mlp,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -543,6 +548,7 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        orig_model.balance_routers() # Quantile Balancing on this micro-batch's routing (no-op for the dense MLP)
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -600,8 +606,9 @@ while True:
         # per layer, named as Marin's train/router/layer_{i}/...: the idlest and the busiest expert, and the raw counts as a
         # histogram with one bucket per expert (wandb takes at most 512 buckets)
         for i, (c, l) in enumerate(zip(counts.tolist(), load.tolist())):
-            moe_log |= {f"router/layer_{i}/load_min": min(l), f"router/layer_{i}/load_max": max(l),
-                        f"router/layer_{i}/routing_hist": wandb.Histogram(np_histogram=(c, list(range(len(c) + 1))))}
+            moe_log |= {f"router/layer_{i}/load_min": min(l), f"router/layer_{i}/load_max": max(l)}
+            if len(c) <= 512:
+                moe_log[f"router/layer_{i}/routing_hist"] = wandb.Histogram(np_histogram=(c, list(range(len(c) + 1))))
         eta_str += f" | expert load: {moe_log['router/load_min']:.2f}-{moe_log['router/load_max']:.2f} cv {moe_log['router/load_cv']:.3f}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {train_loss_f:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     # parameter norms per optimizer group, in fp32 (the embeddings are stored in bf16); the Muon groups share "matrix"
