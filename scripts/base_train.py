@@ -59,6 +59,7 @@ parser.add_argument("--shared-intermediate-size", type=int, default=None, help="
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--attn-res", action="store_true", help="Attention Residuals: every sublayer reads a softmax-over-depth mixture of all earlier outputs instead of a residual stream")
 parser.add_argument("--value-embeds", action="store_true", help="value embeddings (ResFormer): a gated token embedding added to the values of alternating layers")
+parser.add_argument("--fbt-passes", type=int, default=1, help="FBT: passes of the whole model over the sequence, each later one fed the previous pass's state of the position before (1 = the plain model)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -97,6 +98,8 @@ for name, bad in weakened.items():
 # Every run is logged to wandb, online: a run that is not (no --run, or wandb offline or disabled) INVALIDATES THE RUN.
 if args.run == "dummy":
     raise ValueError("--run=dummy: the run is not logged to wandb: this INVALIDATES THE RUN (give it a name)")
+if args.fbt_passes > 1 and args.sample_every > 0: # (the last step samples before the save: the run would end without its checkpoint)
+    raise ValueError("--fbt-passes > 1: the text samples need the Engine's KV cache, which FBT does not have: --sample-every=-1")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -168,6 +171,7 @@ def build_model_meta(depth, dense=False):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern, value_embeds=args.value_embeds, attn_res=args.attn_res, **mlp,
+        fbt_passes=args.fbt_passes,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
