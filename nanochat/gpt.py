@@ -51,6 +51,11 @@ class GPTConfig:
     num_experts_per_token: int = 0
     moe_intermediate_size: int = 0
     activation: str = "relu2" # of every expert's hidden units: "relu2" (relu squared) or "silu"
+    # FBT: fbt_passes passes of the whole model over the sequence. Pass 1 is the plain model; every later pass reads
+    # norm(x + W_s h) at a position, x its token input and h the previous pass's final state at the position before (zero
+    # at position 0). W_s starts at zero, so every pass starts as the plain one. Training sums every pass's loss; evaluation
+    # and inference use the last pass, on full sequences (no KV cache). 1 = the plain model.
+    fbt_passes: int = 1
 
 
 def norm(x):
@@ -243,6 +248,8 @@ class GPT(nn.Module):
             "h": h,
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        if config.fbt_passes > 1: # FBT: W_s, the fusion of the state of the position before (see GPTConfig)
+            self.fb_state = Linear(config.n_embd, config.n_embd, bias=False)
         if not config.attn_res:
             # Per-layer learnable scalars (inspired by modded-nanogpt)
             # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
@@ -276,6 +283,7 @@ class GPT(nn.Module):
 
         wte (embedding):     normal, std=1.0
         lm_head:             normal, std=0.001
+        fb_state (FBT):      zeros
         for each block:
             attn.c_q:        uniform, std=1/sqrt(n_embd)
             attn.c_k:        uniform, std=1/sqrt(n_embd)
@@ -288,6 +296,8 @@ class GPT(nn.Module):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        if self.config.fbt_passes > 1: # FBT: every pass starts as the plain one
+            torch.nn.init.zeros_(self.fb_state.weight)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
@@ -422,6 +432,9 @@ class GPT(nn.Module):
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
+        if self.config.fbt_passes > 1: # FBT: every pass, lm_head included (training scores every pass); W_s in all but the first
+            fb = 6 * self.fb_state.weight.numel()
+            num_flops_per_token = (num_flops_per_token - fb) * self.config.fbt_passes + fb * (self.config.fbt_passes - 1)
         return num_flops_per_token
 
     def num_matmul_params(self):
@@ -509,7 +522,8 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters()) - (self.transformer.h.pseudo_queries.numel() if self.config.attn_res else 0)
         scalars = sum(p.numel() for p in self.scalar_params())
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        fbt = self.fb_state.weight.numel() if self.config.fbt_passes > 1 else 0 # (not a scaling param: the plain model's horizon)
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + fbt
         c = self.config # the matrices a token goes through: all but the routers and the routed experts it is not sent to
         idle = c.n_layer * c.n_embd * (c.num_experts + 2 * (c.num_experts - c.num_experts_per_token) * c.moe_intermediate_size)
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
@@ -520,6 +534,7 @@ class GPT(nn.Module):
             'transformer_matrices': transformer_matrices,
             'active_matrices': transformer_matrices - idle,
             'scalars': scalars,
+            'fbt': fbt,
             'total': total,
         }
 
@@ -536,6 +551,7 @@ class GPT(nn.Module):
         attn_res = self.config.attn_res
         # (a router of routed experts is a matrix too: under AdamW its scores saturate; without shared experts c_fc and c_proj are empty)
         matrix_params = [p for p in self.transformer.h.parameters() if p.numel() > 0 and (not attn_res or p is not self.transformer.h.pseudo_queries)]
+        matrix_params += [self.fb_state.weight] if self.config.fbt_passes > 1 else [] # (FBT's W_s: Muon, like the other matrices)
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -615,25 +631,34 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
-        # Forward the trunk of the Transformer
-        if self.config.attn_res:
-            ves = {int(i): ve(idx).to(x.dtype) for i, ve in self.value_embeds.items()}
-            x = self.transformer.h(x, ves, cos_sin, kv_cache) # (every sublayer reads a normed mixture; the output is normed)
-        else:
-            x0 = x  # save initial normalized embedding for x0 residual
-            n_layer = self.config.n_layer
-            backout_layer = n_layer // 2  # cache at halfway point
-            x_backout = None
-            for i, block in enumerate(self.transformer.h):
-                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-                if i == backout_layer:
-                    x_backout = x
-            # Subtract mid-layer residual to remove low-level features before logit projection
-            if x_backout is not None:
-                x = x - self.backout_lambda.to(x.dtype) * x_backout
-            x = norm(x)
+        # Forward the trunk of the Transformer, once per FBT pass (see GPTConfig)
+        assert kv_cache is None or self.config.fbt_passes == 1, "FBT runs on full sequences: no KV cache"
+        x_tok, states = x, []
+        for p in range(self.config.fbt_passes):
+            if p > 0: # the previous pass's final state of the position before (zero at position 0), fused with the token input
+                x = norm(x_tok + self.fb_state(F.pad(states[-1][:, :-1], (0, 0, 1, 0))))
+            if self.config.attn_res:
+                ves = {int(i): ve(idx).to(x.dtype) for i, ve in self.value_embeds.items()}
+                x = self.transformer.h(x, ves, cos_sin, kv_cache) # (every sublayer reads a normed mixture; the output is normed)
+            else:
+                x0 = x  # save initial normalized embedding for x0 residual
+                n_layer = self.config.n_layer
+                backout_layer = n_layer // 2  # cache at halfway point
+                x_backout = None
+                for i, block in enumerate(self.transformer.h):
+                    x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                    ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                    x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+                    if i == backout_layer:
+                        x_backout = x
+                # Subtract mid-layer residual to remove low-level features before logit projection
+                if x_backout is not None:
+                    x = x - self.backout_lambda.to(x.dtype) * x_backout
+                x = norm(x)
+            states.append(x)
+        scored = len(states) if targets is not None and loss_reduction == 'mean' else 1 # FBT training scores every pass
+        if scored > 1:
+            x, targets = torch.cat(states), targets.repeat(scored, 1)
         if logit_positions is not None:
             x = x[:, logit_positions]
             targets = None if targets is None else targets[:, logit_positions]
@@ -649,7 +674,7 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            return scored * loss # (FBT training: the sum of the passes' losses, each a mean over the same targets)
         else:
             # inference: just return the logits directly
             return logits
