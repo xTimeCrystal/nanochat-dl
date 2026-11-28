@@ -11,72 +11,48 @@ Notes:
 The whole thing is made as efficient as possible.
 """
 
+import ast
+import operator
 import torch
 import torch.nn.functional as F
-import signal
-import warnings
-from contextlib import contextmanager
 from collections import deque
-from nanochat.common import compute_init, autodetect_device_type, COMPUTE_DTYPE
-from nanochat.checkpoint_manager import load_model
+from nanochat.common import COMPUTE_DTYPE
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
-@contextmanager
-def timeout(duration, formula):
-    def timeout_handler(signum, frame):
-        raise Exception(f"'{formula}': timed out after {duration} seconds")
-
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(duration)
-    yield
-    signal.alarm(0)
-
-def eval_with_timeout(formula, max_time=3):
-    try:
-        with timeout(max_time, formula):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", SyntaxWarning)
-                return eval(formula, {"__builtins__": {}}, {})
-    except Exception as e:
-        signal.alarm(0)
-        # print(f"Warning: Failed to eval {formula}, exception: {e}") # it's ok ignore wrong calculator usage
-        return None
+_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+    ast.UAdd: operator.pos, ast.USub: operator.neg,
+}
 
 def use_calculator(expr):
-    """
-    Evaluate a Python expression safely.
-    Supports both math expressions and string operations like .count()
-    """
-    # Remove commas from numbers
-    expr = expr.replace(",", "")
-
-    # Check if it's a pure math expression (old behavior)
-    if all([x in "0123456789*+-/.() " for x in expr]):
-        if "**" in expr:  # disallow power operator
-            return None
-        return eval_with_timeout(expr)
-
-    # Check if it's a string operation we support
-    # Allow: strings (single/double quotes), .count(), letters, numbers, spaces, parens
-    allowed_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'\"()._ "
-    if not all([x in allowed_chars for x in expr]):
+    """Safely evaluate simple arithmetic or str.count() expressions."""
+    if not isinstance(expr, str) or len(expr) > 1000:
         return None
-
-    # Disallow dangerous patterns
-    dangerous_patterns = ['__', 'import', 'exec', 'eval', 'compile', 'open', 'file',
-                         'input', 'raw_input', 'globals', 'locals', 'vars', 'dir',
-                         'getattr', 'setattr', 'delattr', 'hasattr']
-    expr_lower = expr.lower()
-    if any(pattern in expr_lower for pattern in dangerous_patterns):
+    if "'" not in expr and '"' not in expr:
+        expr = expr.replace(",", "")
+    def _eval(n):
+        if isinstance(n, ast.Constant) and type(n.value) in (int, float, str):
+            return n.value
+        if isinstance(n, ast.UnaryOp) and type(n.op) in _OPS:
+            v = _eval(n.operand)
+            if type(v) in (int, float):
+                return _OPS[type(n.op)](v)
+        if isinstance(n, ast.BinOp) and type(n.op) in _OPS:
+            a, b = _eval(n.left), _eval(n.right)
+            if type(a) in (int, float) and type(b) in (int, float):
+                return _OPS[type(n.op)](a, b)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "count" and not n.keywords and len(n.args) == 1:
+            s, sub = _eval(n.func.value), _eval(n.args[0])
+            if isinstance(s, str) and isinstance(sub, str):
+                return s.count(sub)
+        raise ValueError
+    try:
+        res = _eval(ast.parse(expr.strip(), mode="eval").body)
+        return res if type(res) in (int, float) else None
+    except Exception:
         return None
-
-    # Only allow .count() method for now (can expand later)
-    if '.count(' not in expr:
-        return None
-
-    # Evaluate with timeout
-    return eval_with_timeout(expr)
 
 # -----------------------------------------------------------------------------
 class KVCache:
@@ -202,11 +178,11 @@ class Engine:
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        logits = self.model.forward(ids, kv_cache=kv_cache_prefill, logit_positions=slice(-1, None))
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else max(len(tokens), self.model.config.sequence_len)
         kv_cache_decode = KVCache(
             batch_size=num_samples,
             seq_len=kv_length_hint,
@@ -305,9 +281,12 @@ if __name__ == "__main__":
     is equivalent to the faster Engine.generate function here.
     """
     import time
+    from nanochat.common import compute_init, autodetect_device_type
+    from nanochat.checkpoint_manager import load_model
     # init compute
     device_type = autodetect_device_type()
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
     # load the model and tokenizer
     model, tokenizer, meta = load_model("base", device, phase="eval")
     bos_token_id = tokenizer.get_bos_token_id()
@@ -317,7 +296,7 @@ if __name__ == "__main__":
     prompt_tokens = tokenizer.encode("The chemical formula of water is", prepend=bos_token_id)
     # generate the reference sequence using the model.generate() function
     generated_tokens = []
-    torch.cuda.synchronize()
+    synchronize()
     t0 = time.time()
     stream = model.generate(prompt_tokens, **kwargs)
     for token in stream:
@@ -325,7 +304,7 @@ if __name__ == "__main__":
         chunk = tokenizer.decode([token])
         print(chunk, end="", flush=True)
     print()
-    torch.cuda.synchronize()
+    synchronize()
     t1 = time.time()
     print(f"Reference time: {t1 - t0:.2f}s")
     reference_ids = generated_tokens
@@ -333,7 +312,7 @@ if __name__ == "__main__":
     generated_tokens = []
     engine = Engine(model, tokenizer)
     stream = engine.generate(prompt_tokens, num_samples=1, **kwargs) # note: runs in fp32
-    torch.cuda.synchronize()
+    synchronize()
     t0 = time.time()
     for token_column, token_masks in stream:
         token = token_column[0] # only print out the first row
@@ -341,7 +320,7 @@ if __name__ == "__main__":
         chunk = tokenizer.decode([token])
         print(chunk, end="", flush=True)
     print()
-    torch.cuda.synchronize()
+    synchronize()
     t1 = time.time()
     print(f"Engine time: {t1 - t0:.2f}s")
     # compare the two sequences

@@ -5,7 +5,7 @@ python -m pytest tests/test_engine.py -v
 """
 
 import torch
-from nanochat.engine import KVCache, Engine
+from nanochat.engine import KVCache, Engine, use_calculator
 from dataclasses import dataclass
 
 
@@ -36,7 +36,7 @@ class MockModel:
     def get_device(self):
         return self._device
 
-    def forward(self, ids, kv_cache=None):
+    def forward(self, ids, kv_cache=None, logit_positions=None):
         """Return uniform logits so sampling is spread across vocab."""
         B, T = ids.shape
         # With FA3, flash_attn_with_kvcache updates cache in-place and we advance position
@@ -44,6 +44,8 @@ class MockModel:
             kv_cache.advance(T)
         # Uniform logits -> equal probability for all tokens
         logits = torch.zeros(B, T, self.vocab_size)
+        if logit_positions is not None:
+            logits = logits[:, logit_positions]
         return logits
 
 
@@ -265,3 +267,43 @@ def test_different_seeds_introduce_variation_when_temperature_nonzero():
 
     # Sanity check: sampling actually introduces variation
     assert len(outputs) > 1, "All seeds produced the same output which is statistically highly improbable."
+
+
+def test_use_calculator():
+    assert use_calculator("2 + 3 * 4") == 14
+    assert use_calculator(" 1,000 + 2,500 ") == 3500
+    assert use_calculator("-5 + 3") == -2
+    assert use_calculator("10 / 4") == 2.5
+    assert use_calculator("'strawberry'.count('r')") == 3
+    assert use_calculator("'a,b,c'.count(',')") == 2
+    for bad in ["", "2 ** 1000", "10 / 0", "'hello'", "'a' * 1000000", "True + 1", "__import__('os').system('x')"]:
+        assert use_calculator(bad) is None
+
+
+def test_gpt_single_token_and_kvcache_equivalence():
+    from nanochat.common import COMPUTE_DTYPE
+    from nanochat.gpt import GPT, GPTConfig
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cfg = GPTConfig(sequence_len=64, vocab_size=262, n_layer=4, n_head=2, n_kv_head=2, n_embd=64, window_pattern="SL")
+    torch.manual_seed(0)
+    with torch.device("meta"):
+        model = GPT(cfg)
+    model.to_empty(device=device)
+    model.init_weights()
+    model.eval()
+    tok = ByteTokenizer()
+
+    # T == 1 forward + Engine vs GPT.generate equivalence from 1-token prompt
+    prompt = [tok.get_bos_token_id()]
+    assert list(model.generate(prompt, max_tokens=6, temperature=0.0)) == [
+        c[0] for c, _ in Engine(model, tok).generate(prompt, num_samples=1, max_tokens=6, temperature=0.0)
+    ]
+
+    # Multi-token KV-cache continuation matches full uncached forward
+    ids = torch.tensor([[261, 10, 20, 30, 40, 50, 60]], dtype=torch.long, device=device)
+    with torch.inference_mode():
+        full = model(ids)
+        kv = KVCache(1, cfg.n_kv_head, 16, cfg.n_embd // cfg.n_head, cfg.n_layer, device, COMPUTE_DTYPE)
+        cached = torch.cat([model(ids[:, :4], kv_cache=kv), model(ids[:, 4:], kv_cache=kv)], dim=1)
+    assert torch.allclose(cached, full, atol=1e-2, rtol=1e-2)
