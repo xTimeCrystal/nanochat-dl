@@ -19,6 +19,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 import argparse
 import os
 import itertools
+from dataclasses import asdict
 import wandb
 import torch
 import torch.distributed as dist
@@ -58,6 +59,7 @@ parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k 
 parser.add_argument("--eval-examples", type=int, default=400, help="number of examples for pass@k evaluation")
 parser.add_argument("--save-every", type=int, default=60, help="save checkpoint every N steps")
 args = parser.parse_args()
+assert args.num_samples % args.device_batch_size == 0, "num_samples must be divisible by device_batch_size"
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
@@ -102,7 +104,7 @@ def get_batch():
         masks = []
         num_sampling_steps = args.num_samples // args.device_batch_size # go sequentially to prevent OOMs
         for sampling_step in range(num_sampling_steps):
-            seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
+            seed = ((step * 100_003 + example_idx) * 1_009 + sampling_step) & 0x7FFFFFFF # deterministic positive int32 seed
             generated_token_sequences_batch, masks_batch = engine.generate_batch(
                 tokens,
                 num_samples=args.device_batch_size,
@@ -253,6 +255,7 @@ for step in range(num_steps):
         # We need one more loop because we can never exceed the device_batch_size
         assert inputs_all.size(0) % args.device_batch_size == 0
         num_passes = inputs_all.size(0) // args.device_batch_size
+        total_valid = (targets_all >= 0).sum().clamp(min=1)
         for pass_idx in range(num_passes):
             # Pluck out the batch for this pass
             b0, b1 = pass_idx * args.device_batch_size, (pass_idx + 1) * args.device_batch_size
@@ -264,9 +267,8 @@ for step in range(num_steps):
             logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (B, T)
             # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()
-            # normalize by the number of valid tokens, number of passes, and examples_per_rank
-            num_valid = (targets >= 0).sum().clamp(min=1)
-            pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
+            # normalize by total valid tokens across all passes for this example (so micro-batching is exact)
+            pg_obj = pg_obj / (total_valid * examples_per_rank)
             # Note, there is no need to add PPO ratio+clip because we are on policy
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
@@ -310,14 +312,16 @@ for step in range(num_steps):
         depth = model.config.n_layer
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
-        model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+        model_config_kwargs = asdict(model.config)
         save_checkpoint(
             checkpoint_dir,
             step,
             model.state_dict(),
             None, # note: we don't bother to save the optimizer state
             {
+                "step": step,
                 "model_config": model_config_kwargs,
+                "user_config": user_config,
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")

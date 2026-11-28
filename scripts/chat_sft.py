@@ -100,7 +100,7 @@ for name, fallback, source in [
     ("device_batch_size", 32,    meta),
     ("total_batch_size",  524288, meta),
     ("embedding_lr",      0.3,   pretrain_user_config),
-    ("unembedding_lr",    0.004, pretrain_user_config),
+    ("unembedding_lr",    0.008, pretrain_user_config),
     ("matrix_lr",         0.02,  pretrain_user_config),
 ]:
     arg_val = getattr(args, name)
@@ -132,19 +132,18 @@ token_bytes = get_token_bytes(device=device)
 optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
-# Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
-# pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
-# restore our fresh SFT LRs after loading.
+# Note: load_state_dict overwrites param_group metadata (LRs, weight_decay, betas, etc.)
+# with the pretrained values. Save and restore our fresh SFT param_group hyperparams after loading.
 base_dir = get_base_dir()
 if args.load_optimizer:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
-        base_lrs = [group["lr"] for group in optimizer.param_groups]
+        fresh_groups = [{k: v for k, v in group.items() if k != "params"} for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
         del optimizer_data
-        for group, base_lr in zip(optimizer.param_groups, base_lrs):
-            group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        for group, fresh in zip(optimizer.param_groups, fresh_groups):
+            group.update(fresh)
+        print0("Loaded optimizer state from pretrained checkpoint (state buffers only, hyperparams reset)")
     else:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
 
@@ -205,7 +204,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
+            ids, mask = tokenizer.render_conversation(conversation, max_tokens=row_capacity)
             conv_buffer.append((ids, mask))
             cursor += ddp_world_size
             if cursor >= dataset_size:
@@ -422,9 +421,10 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    loss_sum = 0
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
-        train_loss = loss.detach() # for logging
+        loss_sum = loss_sum + loss.detach()
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -449,6 +449,10 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
+    train_loss = loss_sum / grad_accum_steps
+    if is_ddp_initialized():
+        dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
+    train_loss_f = train_loss.item()
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -458,8 +462,8 @@ while True:
     step += 1
 
     # logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**step) # debias the EMA
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
